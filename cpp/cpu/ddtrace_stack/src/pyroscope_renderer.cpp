@@ -52,6 +52,33 @@ StackRenderer::render_thread_begin(PyThreadState* /*tstate*/,
 }
 
 void
+StackRenderer::render_cpu_sample_begin(std::string_view name,
+                                       microsecond_t cpu_time_us,
+                                       uintptr_t thread_id,
+                                       unsigned long native_id)
+{
+    // Same reset as render_thread_begin: a stack that never reached
+    // render_stack_end must not bleed its frames into this one.
+    sample.clear();
+    sample_active = true;
+
+    thread_state.id = thread_id;
+    thread_state.native_id = native_id;
+    thread_state.name = std::string(name);
+
+    // Unlike the wall path, the weight is already known here and is not a
+    // per-tick delta: the SIGPROF handler read the thread's own CPU clock at
+    // capture time, so this sample accounts for exactly the CPU that elapsed
+    // between the previous expiration on this thread and this one. There is no
+    // wall interval to record and render_cpu_time() is never called for it.
+    thread_state.wall_time_ns = 0;
+    thread_state.cpu_time_ns = 1000 * cpu_time_us;
+
+    sample.set_pid(pid);
+    sample.set_thread(static_cast<uint64_t>(thread_id), thread_state.name);
+}
+
+void
 StackRenderer::render_task_begin(std::string_view /*task_name*/, bool /*on_cpu*/, uint64_t /*task_id*/)
 {
     // Pyroscope does not model asyncio tasks as a separate dimension, so a

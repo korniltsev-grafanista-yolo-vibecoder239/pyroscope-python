@@ -169,7 +169,7 @@ fn initialize_agent(
 
     // Fail loudly rather than falling back to py-spy: a silent fallback would
     // report one implementation's profile under another's name.
-    if cpu_enabled && let Err(reason) = cpu_profiler.check_supported(py) {
+    if cpu_enabled && let Err(reason) = cpu_profiler.check_supported(py, sample_rate) {
         return Err(PyRuntimeError::new_err(reason));
     }
 

@@ -162,9 +162,85 @@ pub const fn ddtrace_built() -> bool {
 
 #[cfg(pyroscope_cpu_ddtrace)]
 unsafe extern "C" {
-    fn pyroscope_cpu_ddtrace_start(sample_rate_hz: u32, max_nframes: u32) -> i32;
+    fn pyroscope_cpu_ddtrace_can_start(sample_rate_hz: u32, cpu_timer_enabled: i32) -> i32;
+    fn pyroscope_cpu_ddtrace_min_interval_ms() -> u64;
+    fn pyroscope_cpu_ddtrace_start(
+        sample_rate_hz: u32,
+        max_nframes: u32,
+        cpu_timer_enabled: i32,
+    ) -> i32;
     fn pyroscope_cpu_ddtrace_stop();
     fn pyroscope_cpu_ddtrace_postfork_child();
+}
+
+/// Why the vendored sampler could not start with this configuration, checked
+/// without changing any state.
+///
+/// Used by [`CpuProfiler::check_supported`] so `configure()` raises with the
+/// reason. Some of these are only knowable at runtime -- whether this process
+/// already ran a CPU profiler, whether the timer engine disabled itself -- which
+/// is why they cannot live in the platform/version checks next to it.
+pub fn ddtrace_unsupported_reason(profiler: CpuProfiler, sample_rate: u32) -> Option<String> {
+    let cpu_timer = match profiler {
+        CpuProfiler::Ddtrace => false,
+        CpuProfiler::DdtraceCpuTimer => true,
+        CpuProfiler::PySpy => return None,
+    };
+    if !ddtrace_built() {
+        // There is nothing to ask: the static library is not linked in. The
+        // caller reports that case with the platform detail it has to hand.
+        return None;
+    }
+    match unsafe { ddtrace_can_start(sample_rate, cpu_timer) } {
+        0 => None,
+        status => Some(ddtrace_start_error(profiler, status)),
+    }
+}
+
+/// Explains a non-zero status from `pyroscope_cpu_ddtrace_start`.
+///
+/// Mirrors the `Status` enum in `cpp/cpu/ddtrace_stack/src/pyroscope_entry.cpp`;
+/// keep the two in step. The text lives here rather than in C++ so the whole
+/// user-facing story of why a profiler refused to start is in one place.
+fn ddtrace_start_error(profiler: CpuProfiler, status: i32) -> String {
+    let detail = match status {
+        1 => "it is already running in this process".to_string(),
+        2 => "sample_rate must be greater than zero".to_string(),
+        3 => "the sampling thread could not be started".to_string(),
+        4 => format!(
+            "the per-thread CPU timers could not be armed. A process can run \
+             cpu_profiler={} at most once: the timer engine refuses to re-arm \
+             after it has been shut down, because a SIGPROF left over from a \
+             deleted timer must not find live state again. Configure it once \
+             per process, or use cpu_profiler=ddtrace",
+            profiler.name()
+        ),
+        5 => format!(
+            "this process has already committed to a different CPU profiler \
+             configuration. cpu_profiler={} cannot be selected after another \
+             CPU profiler has run here (switching mid-process would mix two ways \
+             of measuring CPU time into one profile), and a fork child of a \
+             CPU-timer session inherits its sample_rate and cannot change it",
+            profiler.name()
+        ),
+        6 => {
+            // The floor comes from the engine rather than being restated here,
+            // so the message cannot drift from the limit it describes.
+            let floor_ms = unsafe { ddtrace_min_interval_ms() }.max(1);
+            format!(
+                "sample_rate is too high for cpu_profiler={}: the timer period \
+                 has a floor of {floor_ms}ms, so {}Hz is the maximum. Lower \
+                 sample_rate, or use cpu_profiler=ddtrace",
+                profiler.name(),
+                1000 / floor_ms,
+            )
+        }
+        _ => format!("status {status}"),
+    };
+    format!(
+        "native CPU profiler '{}' failed to start: {detail}",
+        profiler.name()
+    )
 }
 
 /// Deepest stack we ask the sampler to capture. Matches py-spy's practical
@@ -194,7 +270,8 @@ impl NativeCpu {
 
         let status = unsafe {
             match profiler {
-                CpuProfiler::Ddtrace => ddtrace_start(config.sample_rate),
+                CpuProfiler::Ddtrace => ddtrace_start(config.sample_rate, false),
+                CpuProfiler::DdtraceCpuTimer => ddtrace_start(config.sample_rate, true),
                 CpuProfiler::PySpy => {
                     clear_state();
                     return Err(PyroscopeError::new(
@@ -206,10 +283,7 @@ impl NativeCpu {
 
         if status != 0 {
             clear_state();
-            return Err(PyroscopeError::new(&format!(
-                "native CPU profiler '{}' failed to start (status {status})",
-                profiler.name()
-            )));
+            return Err(PyroscopeError::new(&ddtrace_start_error(profiler, status)));
         }
 
         ACTIVE_PROFILER.store(profiler as u8, Ordering::Release);
@@ -235,7 +309,7 @@ impl NativeCpu {
         ACTIVE_PROFILER.store(NO_ACTIVE_PROFILER, Ordering::Release);
         unsafe {
             match self.profiler {
-                CpuProfiler::Ddtrace => ddtrace_stop(),
+                CpuProfiler::Ddtrace | CpuProfiler::DdtraceCpuTimer => ddtrace_stop(),
                 CpuProfiler::PySpy => {}
             }
         }
@@ -288,7 +362,7 @@ pub fn postfork_child() {
         return;
     }
     unsafe {
-        if active == CpuProfiler::Ddtrace as u8 {
+        if active == CpuProfiler::Ddtrace as u8 || active == CpuProfiler::DdtraceCpuTimer as u8 {
             ddtrace_postfork_child();
         }
     }
@@ -297,10 +371,32 @@ pub fn postfork_child() {
 
 /* --- thin wrappers so the cfg noise lives in one place --- */
 
-unsafe fn ddtrace_start(_sample_rate_hz: u32) -> i32 {
+unsafe fn ddtrace_min_interval_ms() -> u64 {
     #[cfg(pyroscope_cpu_ddtrace)]
     {
-        unsafe { pyroscope_cpu_ddtrace_start(_sample_rate_hz, MAX_NFRAMES) }
+        unsafe { pyroscope_cpu_ddtrace_min_interval_ms() }
+    }
+    #[cfg(not(pyroscope_cpu_ddtrace))]
+    {
+        0
+    }
+}
+
+unsafe fn ddtrace_can_start(_sample_rate_hz: u32, _cpu_timer: bool) -> i32 {
+    #[cfg(pyroscope_cpu_ddtrace)]
+    {
+        unsafe { pyroscope_cpu_ddtrace_can_start(_sample_rate_hz, _cpu_timer.into()) }
+    }
+    #[cfg(not(pyroscope_cpu_ddtrace))]
+    {
+        -1
+    }
+}
+
+unsafe fn ddtrace_start(_sample_rate_hz: u32, _cpu_timer: bool) -> i32 {
+    #[cfg(pyroscope_cpu_ddtrace)]
+    {
+        unsafe { pyroscope_cpu_ddtrace_start(_sample_rate_hz, MAX_NFRAMES, _cpu_timer.into()) }
     }
     #[cfg(not(pyroscope_cpu_ddtrace))]
     {

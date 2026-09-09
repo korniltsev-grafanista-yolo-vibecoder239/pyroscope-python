@@ -1,34 +1,53 @@
-"""End-to-end smoke test for cpu_profiler=CpuProfiler.Ddtrace.
+"""End-to-end smoke test for the vendored CPU profilers.
+
+Covers both modes of cpp/cpu/ddtrace_stack/: CpuProfiler.Ddtrace (the echion
+wall-clock thread walk) and CpuProfiler.DdtraceCpuTimer (per-thread POSIX CPU
+timers delivering SIGPROF). They are checked against the same expectations
+because they are supposed to measure the same thing.
 
 Self-contained: it stands up a local HTTP server that captures the agent's
 push requests and decodes the pprof out of them, so it needs no Pyroscope
 server. Run it with the extension installed:
 
-    python scripts/tests/test_ddtrace_cpu.py
+    python scripts/tests/test_ddtrace_cpu.py                  # both modes
+    python scripts/tests/test_ddtrace_cpu.py ddtrace-cpu-timer
+
+With no argument it re-runs itself once per mode as a subprocess, because a
+process commits to one CPU accounting mode for its whole life and the second
+configure() in the same process is supposed to fail (see below).
 
 What it checks, in order of how easy each is to break:
 
 1. The busy function appears in the profile at all. If the thread
    auto-registration patch in cpp/cpu/ddtrace_stack/src/echion/threads.cc were
    dropped, echion's thread_info_map would stay empty and the profile would be
-   completely blank.
+   completely blank -- and in CPU-timer mode no timer would ever be armed,
+   since that same walk is what arms them.
 2. Reported CPU does not exceed what the process could possibly have used.
-   This is the wall-clock-vs-CPU weighting trap: the sampler walks *every*
-   Python thread each tick, so crediting each tick a full sampling period
-   inflates the total by roughly the thread count.
+   For the wall walk this is the wall-clock-vs-CPU weighting trap: it visits
+   *every* Python thread each tick, so crediting each tick a full sampling
+   period inflates the total by roughly the thread count. For the CPU timer it
+   catches double counting between the two paths -- the wall walk must stop
+   reporting CPU entirely once the timers are armed.
 3. Reported CPU is in the right ballpark versus os.times(), so the previous
    check cannot be satisfied by reporting nothing.
-4. The same holds under thread churn, which is what the recycled-pthread_t half
-   of the threads.cc patch guards: a new thread inheriting a dead thread's
-   pthread_t must not keep the dead thread's CPU clock.
-5. Selecting the profiler where it cannot work (non-Linux, or CPython 3.10)
+4. The same holds under thread churn. For the wall walk that exercises the
+   recycled-pthread_t half of the threads.cc patch: a new thread inheriting a
+   dead thread's pthread_t must not keep the dead thread's CPU clock. For the
+   CPU timer it bounds how much of a short-lived thread's CPU is lost before
+   discovery arms its timer.
+5. Selecting a profiler where it cannot work (non-Linux, or too old a CPython)
    raises instead of silently falling back to py-spy.
+6. For the CPU timer, restarting it in the same process raises. The timer
+   engine refuses to re-arm after shutdown, so a second session would report
+   nothing at all; that has to surface as an error, not an empty profile.
 """
 
 import gzip
 import hashlib
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -41,6 +60,15 @@ logger = logging.getLogger("test_ddtrace_cpu")
 APP_NAME = "pyroscopers.python.test.ddtrace_cpu"
 SAMPLE_RATE = 100
 UPLOAD_INTERVAL = 1
+
+# name -> (CpuProfiler value, minimum CPython, restart in-process must fail)
+#
+# The CPU timer needs 3.12: it reads the running frame from a signal handler and
+# DD_CPU_TIMER_SUPPORTED in src/cpu_timer.cpp draws the line there.
+PROFILERS = {
+    "ddtrace": (pyroscope.CpuProfiler.Ddtrace, (3, 11), False),
+    "ddtrace-cpu-timer": (pyroscope.CpuProfiler.DdtraceCpuTimer, (3, 12), True),
+}
 
 
 # --------------------------------------------------------------------------
@@ -354,27 +382,31 @@ def check_profiles(collector, label, actual_cpu_s, wall_s, nthreads):
             "%s: 'cpuhog' never appeared in the profile; saw %s" % (label, sorted(names)[:20])
         )
 
-    # 2. Values must be CPU nanoseconds, not one sampling period per thread per
-    #    tick. The ceiling is generous (2x) so this only fires on the real bug,
-    #    which overshoots by roughly the thread count.
+    # 2. Values must be CPU nanoseconds the process could actually have burned.
+    #    The wall walk overshoots by roughly the thread count if it credits each
+    #    tick a full sampling period instead of the per-thread CPU delta; the CPU
+    #    timer overshoots by 2x if the wall walk keeps reporting CPU alongside
+    #    it. The ceiling is generous (2x) so this only fires on those real bugs.
     ceiling_s = actual_cpu_s * 2 + 1.0
     if reported_s > ceiling_s:
         raise AssertionError(
             "%s: reported %.2fs of CPU but the process only used %.2fs. "
             "Samples are probably weighted by the sampling period instead of "
-            "the per-thread CPU delta -- see the sample weighting section of "
+            "real CPU time, or both the wall walk and the CPU timers are "
+            "reporting -- see the sample weighting section of "
             "cpp/cpu/ddtrace_stack/VENDOR.md" % (label, reported_s, actual_cpu_s)
         )
 
     # 3. ...and it must not be satisfied by reporting almost nothing. A
     #    sampler that only sees a fraction of the threads (the recycled
-    #    pthread_t bug reported ~5%) fails here.
+    #    pthread_t bug reported ~5%) fails here, as does a CPU timer that never
+    #    gets armed for most threads.
     floor_s = actual_cpu_s * 0.25
     if reported_s < floor_s:
         raise AssertionError(
             "%s: reported only %.2fs of CPU for a process that used %.2fs. "
-            "Threads are probably being skipped or billed against a dead CPU "
-            "clock -- see the threads.cc patch in "
+            "Threads are probably being skipped, billed against a dead CPU "
+            "clock, or never armed -- see the threads.cc patch in "
             "cpp/cpu/ddtrace_stack/VENDOR.md" % (label, reported_s, actual_cpu_s)
         )
 
@@ -382,41 +414,62 @@ def check_profiles(collector, label, actual_cpu_s, wall_s, nthreads):
     logger.info("%s: sample types %s", label, types)
 
 
-def check_unsupported_raises():
+def check_unsupported_raises(name, profiler):
     """Selecting an unbuilt profiler must raise, not fall back to py-spy."""
     try:
         pyroscope.configure(
             application_name=APP_NAME,
             server_address="http://127.0.0.1:1",
-            cpu_profiler=pyroscope.CpuProfiler.Ddtrace,
+            cpu_profiler=profiler,
         )
     except RuntimeError as e:
-        logger.info("unsupported platform raised as expected: %s", e)
+        logger.info("%s: unsupported platform raised as expected: %s", name, e)
         return True
     pyroscope.shutdown()
     return False
 
 
-def main():
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+def check_restart_raises(name, profiler, address):
+    """A second session in this process must raise rather than report nothing.
 
-    supported = sys.platform == "linux" and sys.version_info >= (3, 11)
+    The CPU timer engine will not re-arm after it has been shut down: a SIGPROF
+    left over from a deleted timer must not find live state again. That makes
+    the mode effectively once-per-process, so the second configure() has to
+    fail loudly instead of uploading an empty profile under its name.
+    """
+    try:
+        pyroscope.configure(
+            application_name=APP_NAME,
+            server_address=address,
+            cpu_profiler=profiler,
+            mem_enabled=False,
+        )
+    except RuntimeError as e:
+        logger.info("%s: restart raised as expected: %s", name, e)
+        return True
+    pyroscope.shutdown()
+    return False
+
+
+def run_one(name):
+    profiler, minimum, restart_must_fail = PROFILERS[name]
+
+    supported = sys.platform == "linux" and sys.version_info >= minimum
     if not supported:
-        # cpu_profiler=Ddtrace is Linux/CPython 3.11+ only today; assert that it
-        # says so rather than silently profiling with py-spy.
-        if not check_unsupported_raises():
+        # Assert it says so rather than silently profiling with py-spy.
+        if not check_unsupported_raises(name, profiler):
             raise AssertionError(
-                "cpu_profiler=Ddtrace is not supported on %s/%d.%d but configure() "
+                "cpu_profiler=%s is not supported on %s/%d.%d but configure() "
                 "accepted it instead of raising"
-                % (sys.platform, sys.version_info[0], sys.version_info[1])
+                % (name, sys.platform, sys.version_info[0], sys.version_info[1])
             )
-        logger.info("done (unsupported here: only the rejection path is exercised)")
+        logger.info("%s: done (unsupported here: only the rejection path is exercised)", name)
         return
 
     collector = Collector()
     server, _thread = make_server(collector)
     address = "http://127.0.0.1:%d" % server.server_address[1]
-    logger.info("collector listening on %s", address)
+    logger.info("%s: collector listening on %s", name, address)
 
     nthreads = 4
     pyroscope.configure(
@@ -425,7 +478,7 @@ def main():
         enable_logging=True,
         sample_rate=SAMPLE_RATE,
         upload_interval=UPLOAD_INTERVAL,
-        cpu_profiler=pyroscope.CpuProfiler.Ddtrace,
+        cpu_profiler=profiler,
         report_pid=True,
         report_thread_id=True,
         mem_enabled=False,
@@ -435,17 +488,49 @@ def main():
         cpu_s, wall_s = run_workload(nthreads, duration=6)
         # Let the last upload interval land.
         time.sleep(UPLOAD_INTERVAL * 3)
-        check_profiles(collector, "steady", cpu_s, wall_s, nthreads)
+        check_profiles(collector, name + "/steady", cpu_s, wall_s, nthreads)
 
         collector.reset()
         cpu_s, wall_s = run_workload(nthreads, duration=6, churn=True)
         time.sleep(UPLOAD_INTERVAL * 3)
-        check_profiles(collector, "churn", cpu_s, wall_s, nthreads)
+        check_profiles(collector, name + "/churn", cpu_s, wall_s, nthreads)
     finally:
         pyroscope.shutdown()
+
+    try:
+        if restart_must_fail and not check_restart_raises(name, profiler, address):
+            raise AssertionError(
+                "%s: configure() accepted a second session in this process; it "
+                "cannot actually sample again, so it has to raise instead of "
+                "uploading an empty profile" % name
+            )
+    finally:
         server.shutdown()
 
-    logger.info("done")
+    logger.info("%s: done", name)
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    names = sys.argv[1:] or list(PROFILERS)
+    for name in names:
+        if name not in PROFILERS:
+            raise SystemExit("unknown profiler %r; expected one of %s" % (name, list(PROFILERS)))
+
+    if len(names) == 1:
+        run_one(names[0])
+        return
+
+    # One process per mode: the CPU accounting mode is frozen for the life of
+    # the process, so the second one here would (correctly) refuse to start.
+    failures = []
+    for name in names:
+        print("################ cpu_profiler=%s ################" % name, flush=True)
+        if subprocess.call([sys.executable, os.path.abspath(__file__), name]) != 0:
+            failures.append(name)
+    if failures:
+        raise SystemExit("FAILED: %s" % ", ".join(failures))
 
 
 if __name__ == "__main__":

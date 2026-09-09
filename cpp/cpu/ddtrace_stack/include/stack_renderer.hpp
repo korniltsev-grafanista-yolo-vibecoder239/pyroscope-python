@@ -63,6 +63,15 @@ class StackRenderer
                              microsecond_t wall_time_us,
                              uintptr_t thread_id,
                              unsigned long native_id);
+
+    // Begins a sample that already knows its CPU weight, used by the
+    // signal-driven CPU timer path: the SIGPROF handler measured the thread's
+    // CPU delta at capture time, so there is no per-tick wall interval and no
+    // separate render_cpu_time() call.
+    void render_cpu_sample_begin(std::string_view name,
+                                 microsecond_t cpu_time_us,
+                                 uintptr_t thread_id,
+                                 unsigned long native_id);
     void render_task_begin(std::string_view task_name, bool on_cpu, uint64_t task_id);
     void render_frame(Frame& frame);
     void render_cpu_time(microsecond_t cpu_time_us);

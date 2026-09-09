@@ -1,6 +1,7 @@
 #include "sampler.hpp"
 
 #include "constants.hpp"
+#include "cpu_timer.hpp"
 #include "dd_wrapper/include/profiler_state.hpp"
 #include "dd_wrapper/include/sample.hpp"
 #include "origin_task_links.hpp"
@@ -16,6 +17,7 @@
 #include "echion/threads.h"
 #include "echion/vm.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -24,6 +26,29 @@
 #include <utility>
 
 using namespace Datadog;
+
+namespace {
+
+// Pyroscope patch: slowest the wall walk may run when it is only there to
+// discover threads and arm their CPU timers (see Sampler::capture_samples()).
+//
+// This bounds how long a freshly created thread runs before it gets a timer,
+// and therefore how much of a short-lived thread's CPU never lands in the
+// profile at all. Upstream has no equivalent knob: ddtrace's `threading` patch
+// registers each thread from inside that thread the moment it starts, while this
+// vendoring has no Python layer and has to find threads by walking the
+// interpreter's list.
+//
+// Discovery therefore runs at the configured sample rate, and only falls back to
+// this ceiling when that rate is slower. The walk is a copy_type() and two map
+// lookups per thread with no unwinding, so running it at the sample rate is
+// strictly cheaper than the wall-clock mode, which does the same walk *plus* a
+// full unwind of every thread at that rate. Measured on a thread-churning
+// workload (threads living 300 ms), a 100 ms discovery period accounted for 79%
+// of the process's CPU; matching the 10 ms sample period brought that to 95%.
+constexpr microsecond_t g_cpu_timer_discovery_max_interval_us = 100'000;
+
+} // namespace
 
 static void
 update_fast_copy_stats(ProfilerStats& stats)
@@ -254,9 +279,32 @@ Sampler::adapt_sampling_interval()
 }
 
 void
-Sampler::capture_samples(const microsecond_t wall_time_us)
+Sampler::capture_samples(const microsecond_t wall_time_us, const bool wall_samples)
 {
     auto* const runtime = &_PyRuntime;
+
+    // Pyroscope patch: discovery-only walk when wall samples are switched off.
+    //
+    // Upstream keeps unwinding here in CPU-timer mode and passes
+    // include_cpu_time=false down to ThreadInfo::sample(), because it still
+    // publishes a wall-time profile from those stacks. Pyroscope publishes only
+    // process_cpu: a wall sample with no CPU weight is dropped by
+    // Pyroscope::CpuSample::export_sample(), so unwinding every Python thread
+    // here would be pure overhead -- the opposite of the point of running the
+    // timer-driven sampler.
+    //
+    // The walk itself still has to happen, and is the reason this is not simply
+    // skipped: for_each_thread() is where this vendoring discovers threads (it
+    // has no Python `threading` hook to register them) and therefore also where
+    // it arms their CPU timers. How often it runs -- and so how long a new
+    // thread goes unarmed -- is set by g_cpu_timer_discovery_max_interval_us in
+    // sampling_thread().
+    if (!wall_samples) {
+        for_each_interp(runtime, [&](InterpreterInfo& interp) -> void {
+            for_each_thread(*echion, interp, [](PyThreadState*, ThreadInfo&) {});
+        });
+        return;
+    }
 
     // When max_threads_per_sample is set, we collect all threads first, then apply
     // reservoir sampling (Algorithm R) to select a uniform random subset, and only
@@ -377,9 +425,18 @@ Sampler::sampling_thread(const uint64_t seq_num)
         });
     }
 
+    // The CPU accounting mode is frozen by CpuTimer::Engine::start(), which
+    // Sampler::start() calls before this thread is launched. If the timer engine
+    // later degrades and disables itself, the wall walk does not start reporting
+    // CPU time in its place: a profile that silently changes measurement
+    // mechanism mid-run is worse than one that stops.
+    const bool wall_samples_enabled = !CpuTimer::Engine::get().configured_enabled();
+
     using namespace std::chrono;
     auto sample_time_prev = steady_clock::now();
     auto interval_adjust_time_prev = sample_time_prev;
+    auto next_wall_sample = sample_time_prev;
+    auto next_cpu_drain = sample_time_prev;
 
     // safe_memcpy recovery needs us to own both handlers (PROF-14568): warm up on the
     // syscall copy, upgrade only if we still own them, then re-check and fall back.
@@ -416,13 +473,23 @@ Sampler::sampling_thread(const uint64_t seq_num)
             }
         }
 
-        // Measure CPU time before acquiring the profile lock so lock-wait time
-        // is not counted as sampling overhead.
-        auto sample_capture_cpu_before = get_thread_cpu_time_us();
+        // Two independent deadlines: the wall walk (which also discovers threads)
+        // and the CPU timer ring drain. drain_interval_us() is 0 unless the timer
+        // engine is armed, which is what keeps this loop identical to the
+        // wall-only one when it is not.
+        const auto loop_time_now = steady_clock::now();
+        auto wall_sample_time_now = loop_time_now;
+        auto cpu_drain_time_now = loop_time_now;
+        const bool wall_sample_due = loop_time_now >= next_wall_sample;
+        const auto cpu_drain_interval_us = CpuTimer::Engine::get().drain_interval_us();
+        const bool cpu_drain_due = cpu_drain_interval_us > 0 && loop_time_now >= next_cpu_drain;
 
-        auto sample_time_now = steady_clock::now();
-        auto wall_time_us = duration_cast<microseconds>(sample_time_now - sample_time_prev).count();
-        sample_time_prev = sample_time_now;
+        // Measure CPU time before acquiring the profile lock so lock-wait time
+        // is not counted as sampling overhead. Covers both the wall walk and the
+        // drain, so adaptive sampling sees the sampler thread's whole cost.
+        const auto sample_capture_cpu_before = get_thread_cpu_time_us();
+        size_t greenlet_count = 0;
+        size_t copy_errors = 0;
 
         // Foreign handler handling (see notes before the loop); faulthandler's
         // transient swaps are safe since the sampler is paused around them.
@@ -430,7 +497,7 @@ Sampler::sampling_thread(const uint64_t seq_num)
             if (!fast_copy_upgraded) {
                 // Warmup window: still on the safe syscall copy. Once it elapses,
                 // upgrade to safe_memcpy only if we still own the handlers.
-                if (sample_time_now >= fast_copy_warmup_deadline) {
+                if (loop_time_now >= fast_copy_warmup_deadline) {
                     fast_copy_upgraded = true; // decide once
                     if (segv_handler_installed()) {
                         set_fast_copy_enabled(true);
@@ -440,6 +507,7 @@ Sampler::sampling_thread(const uint64_t seq_num)
                         // the process.
                         handler_fallback_done = true;
                         mark_fast_copy_syscall_fallback();
+                        CpuTimer::Engine::get().disable_for_fault_handler_swap();
                         std::cerr << "ddtrace stack profiler: another component owns the SIGSEGV/SIGBUS "
                                      "handler; keeping the syscall-based memory copy to avoid crashing."
                                   << std::endl;
@@ -453,6 +521,7 @@ Sampler::sampling_thread(const uint64_t seq_num)
                 // it over the alternative, which is crashing under a foreign handler.
                 handler_fallback_done = true;
                 mark_fast_copy_syscall_fallback();
+                CpuTimer::Engine::get().disable_for_fault_handler_swap();
                 std::cerr << "ddtrace stack profiler: SIGSEGV/SIGBUS handler was taken over by another "
                              "component; falling back to syscall-based memory copy to avoid crashing."
                           << std::endl;
@@ -468,34 +537,64 @@ Sampler::sampling_thread(const uint64_t seq_num)
             }
         }
 
-        // Reset per-cycle asyncio task accumulator before iterating sampled threads
-        echion->reset_asyncio_task_count();
-
         try {
-            capture_samples(wall_time_us);
-
-            // Collect greenlet count before acquiring the profile lock to avoid
-            // holding two locks simultaneously (greenlet lock then profile lock).
-            size_t greenlet_count;
-            {
-                const std::lock_guard<std::mutex> guard(echion->greenlet_info_map_lock());
-                greenlet_count = echion->greenlet_info_map().size();
+            // Drain first when both deadlines are due: a slow wall walk must not
+            // add avoidable latency to samples already sitting in the rings, and a
+            // full ring drops samples.
+            if (cpu_drain_due) {
+                cpu_drain_time_now = steady_clock::now();
+                CpuTimer::Engine::get().drain(*echion);
             }
 
-            // Drain copy_memory errors accumulated since the last sampling cycle.
-            auto copy_errors = g_copy_memory_error_count.exchange(0, std::memory_order_relaxed);
+            if (wall_sample_due) {
+                wall_sample_time_now = steady_clock::now();
+                const auto wall_time_us =
+                  duration_cast<microseconds>(wall_sample_time_now - sample_time_prev).count();
+                sample_time_prev = wall_sample_time_now;
+
+                // Reset per-cycle asyncio task accumulator before iterating sampled threads
+                echion->reset_asyncio_task_count();
+
+                capture_samples(wall_time_us, wall_samples_enabled);
+
+                // Collect greenlet count before acquiring the profile lock to avoid
+                // holding two locks simultaneously (greenlet lock then profile lock).
+                {
+                    const std::lock_guard<std::mutex> guard(echion->greenlet_info_map_lock());
+                    greenlet_count = echion->greenlet_info_map().size();
+                }
+
+                // Drain copy_memory errors accumulated since the last sampling cycle.
+                copy_errors = g_copy_memory_error_count.exchange(0, std::memory_order_relaxed);
+            }
 
             if (do_adaptive_sampling) {
                 // Adjust the sampling interval at most every second
-                if (sample_time_now - interval_adjust_time_prev > microseconds(g_adaptive_sampling_interval_us)) {
+                if (loop_time_now - interval_adjust_time_prev > microseconds(g_adaptive_sampling_interval_us)) {
                     adapt_sampling_interval();
-                    interval_adjust_time_prev = sample_time_now;
+                    interval_adjust_time_prev = loop_time_now;
                 }
+            }
+
+            if (wall_sample_due) {
+                // Pyroscope patch: in CPU-timer mode the wall walk carries no
+                // samples, only thread discovery and timer arming. The user's
+                // sample rate drives the per-thread timers instead, and is
+                // reused here as the discovery cadence; see
+                // Sampler::capture_samples().
+                const auto wall_interval_us =
+                  wall_samples_enabled
+                    ? sample_interval_us.load()
+                    : std::min(sample_interval_us.load(), g_cpu_timer_discovery_max_interval_us);
+                next_wall_sample = wall_sample_time_now + microseconds(wall_interval_us);
+            }
+            if (cpu_drain_due) {
+                next_cpu_drain = cpu_drain_time_now + microseconds(cpu_drain_interval_us);
             }
 
             // Measure CPU time before acquiring the profile lock so lock-wait time is
             // not counted as sampling overhead.
-            auto sample_capture_cpu_after = get_thread_cpu_time_us();
+            const auto sample_capture_cpu_after = get_thread_cpu_time_us();
 
             // Update all end-of-cycle stats under a single borrow so they always land in
             // the same upload window as the samples they describe. Without this, the uploader
@@ -504,19 +603,21 @@ Sampler::sampling_thread(const uint64_t seq_num)
             {
                 auto borrow = Sample::profile_borrow();
 
-                borrow.stats().increment_sampling_event_count();
-                borrow.stats().set_string_table_count(echion->string_table().size());
-                update_fast_copy_stats(borrow.stats());
-                borrow.stats().set_asyncio_task_count(echion->asyncio_task_count());
-                borrow.stats().set_greenlet_count(greenlet_count);
+                if (wall_sample_due) {
+                    borrow.stats().increment_sampling_event_count();
+                    borrow.stats().set_string_table_count(echion->string_table().size());
+                    update_fast_copy_stats(borrow.stats());
+                    borrow.stats().set_asyncio_task_count(echion->asyncio_task_count());
+                    borrow.stats().set_greenlet_count(greenlet_count);
 
-                if (copy_errors > 0) {
-                    borrow.stats().add_copy_memory_error_count(copy_errors);
+                    if (copy_errors > 0) {
+                        borrow.stats().add_copy_memory_error_count(copy_errors);
+                    }
                 }
 
-                size_t cpu_diff = sample_capture_cpu_after - sample_capture_cpu_before;
-                if (cpu_diff > 0) {
-                    borrow.stats().add_sample_capture_cpu_time_us(cpu_diff);
+                if (sample_capture_cpu_after > sample_capture_cpu_before) {
+                    borrow.stats().add_sample_capture_cpu_time_us(sample_capture_cpu_after -
+                                                                  sample_capture_cpu_before);
                 }
             }
         } catch (const std::exception& e) {
@@ -539,11 +640,15 @@ Sampler::sampling_thread(const uint64_t seq_num)
             break;
         }
 
-        // Sleep for the remainder of the interval, get it atomically
+        // Sleep until the nearest of the two deadlines.
         // Generally speaking system "sleep" times will wait _at least_ as long as the specified time, so
         // in actual fact the duration may be more than we indicated.  This tends to be more true on busy
         // systems.
-        std::this_thread::sleep_until(sample_time_now + microseconds(sample_interval_us.load()));
+        auto next_wakeup = next_wall_sample;
+        if (CpuTimer::Engine::get().drain_interval_us() > 0) {
+            next_wakeup = std::min(next_wakeup, next_cpu_drain);
+        }
+        std::this_thread::sleep_until(next_wakeup);
     }
 
     // Signal that the thread is exiting
@@ -592,6 +697,11 @@ Sampler::postfork_child()
     paused_.store(false);
     new (&pause_mutex_) std::mutex();
     new (&pause_cv_) std::condition_variable();
+
+    // The parent's per-thread CPU timers do not survive fork (POSIX timers are
+    // not inherited) and the CaptureState for its threads is stale, so drop the
+    // lot and rebuild the signal-handler control plane for this process.
+    CpuTimer::Engine::get().postfork_child();
 
     // Clear stale echion state (mutexes, maps) from parent process
     if (echion) {
@@ -762,9 +872,12 @@ Sampler::register_thread(uint64_t id, uint64_t native_id, const char* name)
 void
 Sampler::unregister_thread(uint64_t id)
 {
-    // unregistering threads requires coordinating with one of echion's global locks, which we take here.
-    const std::lock_guard<std::mutex> thread_info_guard{ echion->thread_info_map_lock() };
-    echion->thread_info_map().erase(id);
+    {
+        // unregistering threads requires coordinating with one of echion's global locks, which we take here.
+        const std::lock_guard<std::mutex> thread_info_guard{ echion->thread_info_map_lock() };
+        echion->thread_info_map().erase(id);
+    }
+    CpuTimer::Engine::get().unregister_thread(id);
 }
 
 bool
@@ -774,6 +887,11 @@ Sampler::start()
     std::call_once(once, [this]() { this->one_time_setup(); });
 
     sampler_active_.store(true);
+
+    // Arm the CPU timer engine before the sampling thread exists, so that thread
+    // can freeze the accounting mode it will run under. A no-op unless
+    // CpuTimer::Engine::configure() enabled it.
+    CpuTimer::Engine::get().start();
 
     // Launch the sampling thread.
     // Thread lifetime is bounded by the value of the sequence number.  When it is changed from the value the thread was
@@ -825,6 +943,11 @@ Sampler::stop()
     if (!exited) {
         std::cerr << "Failed to stop sampling thread after timeout, exiting forcefully." << std::endl;
     }
+
+    // Delete the per-thread timers and drain what they had already captured.
+    // Deliberately after the sampling thread is gone: shutdown() drains, and two
+    // concurrent consumers on a single-consumer ring is not a thing.
+    CpuTimer::Engine::get().shutdown(*echion);
 }
 
 PauseResult

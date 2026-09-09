@@ -48,6 +48,7 @@ file(GLOB ECHION_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/echion/*.cc)
 
 set(SOURCE_FILES
         ${ECHION_SOURCES}
+        src/cpu_timer.cpp
         src/sampler.cpp
         src/thread_span_links.cpp
         src/origin_task_links.cpp

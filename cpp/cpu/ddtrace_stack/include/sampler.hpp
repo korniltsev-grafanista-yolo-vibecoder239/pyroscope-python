@@ -84,7 +84,11 @@ class Sampler
 
     // Captures one sampling cycle across all threads (or a reservoir-sampled subset thereof
     // when max_threads_per_sample is set).
-    void capture_samples(microsecond_t wall_time_us);
+    //
+    // With `wall_samples` false the walk only discovers threads and reconciles
+    // their CPU timers; no stack is unwound. See the Pyroscope patch on the
+    // definition.
+    void capture_samples(microsecond_t wall_time_us, bool wall_samples);
 
     // Rolling window for p_stable: ring buffer of process_delta values (us CPU per adapt window).
     // p_stable is the p-th percentile of this buffer, giving a stable estimate of app CPU usage

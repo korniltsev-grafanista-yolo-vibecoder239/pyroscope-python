@@ -2,6 +2,8 @@
 #include <echion/tasks.h>
 #include <echion/threads.h>
 
+#include "cpu_timer.hpp"
+
 #include <echion/echion_sampler.h>
 
 #include "dd_wrapper/include/defer.hpp"
@@ -925,6 +927,38 @@ for_each_thread(EchionSampler& echion, InterpreterInfo& interp, const PyThreadSt
                 } else {
                     it->second = std::move(*maybe_thread_info);
                 }
+            }
+
+            // Pyroscope patch: arm this thread's CPU timer from the same walk.
+            //
+            // Upstream also reconciles CPU timers here, but only as a safety net
+            // behind ddtrace's `threading` patch, which arms a timer from inside
+            // each new thread the moment it starts. With no Python layer this
+            // walk is the *only* discovery mechanism, so it is also the only
+            // place a timer can be armed, and two things follow from that:
+            //
+            //  - Arming is always remote (it runs on the sampling thread, not on
+            //    the thread being armed), so Engine::register_thread() cannot
+            //    install an alternate signal stack for the target thread and
+            //    cannot inspect its signal mask. A thread that blocks SIGPROF
+            //    therefore contributes no CPU samples rather than being detected
+            //    and disabling the engine; it is missing CPU, not a crash. Its
+            //    guarded reads still recover, they just run on the thread's
+            //    ordinary stack (the faults are bad-pointer reads, not stack
+            //    overflow, so there is room).
+            //  - A thread is unarmed until the next walk, which is why that walk
+            //    keeps running on its own cadence in CPU-timer mode. See
+            //    g_cpu_timer_discovery_max_interval_us in ../sampler.cpp.
+            //
+            // has_thread() first so a thread that is already armed does not pay
+            // for a registry lookup plus a timer syscall on every walk. All of
+            // this is inert unless the CPU timer engine was configured on.
+            if (discovered_native_id != 0 &&
+                !Datadog::CpuTimer::Engine::get().has_thread(tstate.thread_id, discovered_native_id)) {
+                // Empty name for the same reason ThreadInfo gets one above: the
+                // Python-level thread name is not reachable off-GIL from here.
+                Datadog::CpuTimer::Engine::get().register_thread(
+                  tstate.thread_id, discovered_native_id, "", tstate_addr);
             }
 #else
             // TODO(macos): the Darwin path cannot auto-register safely.

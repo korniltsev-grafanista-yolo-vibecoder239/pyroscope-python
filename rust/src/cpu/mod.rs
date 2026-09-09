@@ -1,12 +1,13 @@
 //! CPU profiler selection.
 //!
-//! py-spy is the default and works everywhere. `Ddtrace` is a vendored native
-//! sampler under `cpp/cpu/ddtrace_stack/` (dd-trace-py's echion-based
-//! wall-clock sampler), driven over a C ABI.
+//! py-spy is the default and works everywhere. The others are modes of the
+//! vendored native sampler under `cpp/cpu/ddtrace_stack/`, driven over a C ABI:
+//! `Ddtrace` runs its wall-clock thread walk, `DdtraceCpuTimer` runs the
+//! signal-driven per-thread CPU timers instead.
 //!
-//! Both report through the same `StackBuffer` -> `Report` -> `encode::pprof`
-//! -> `session` path, so switching implementations changes what is sampled and
-//! how much it costs, not how the result is encoded or uploaded.
+//! All of them report through the same `StackBuffer` -> `Report` ->
+//! `encode::pprof` -> `session` path, so switching implementations changes what
+//! is sampled and how much it costs, not how the result is encoded or uploaded.
 
 pub mod native;
 
@@ -27,6 +28,12 @@ pub enum CpuProfiler {
     /// every Python thread on a wall-clock interval and weights each stack by
     /// that thread's CPU delta. See `cpp/cpu/ddtrace_stack/VENDOR.md`.
     Ddtrace = 1,
+    /// The same vendored sampler, sampling on per-thread CPU time instead of
+    /// wall time: every Python thread gets a POSIX CPU timer whose SIGPROF is
+    /// delivered on that thread, and the handler captures its own stack. A
+    /// thread is only interrupted once it has actually burned another interval
+    /// of CPU, so no thread has to be walked to find out whether it ran.
+    DdtraceCpuTimer = 2,
 }
 
 impl CpuProfiler {
@@ -34,46 +41,74 @@ impl CpuProfiler {
         match self {
             CpuProfiler::PySpy => "pyspy",
             CpuProfiler::Ddtrace => "ddtrace",
+            CpuProfiler::DdtraceCpuTimer => "ddtrace-cpu-timer",
         }
     }
 
-    /// Why this profiler cannot run here, or `Ok(())` if it can.
+    /// Why this profiler cannot run here with this `sample_rate`, or `Ok(())`
+    /// if it can.
     ///
     /// Callers surface this as an error rather than silently falling back to
     /// py-spy: a silent fallback would report one implementation's profile
-    /// under another's name.
-    pub fn check_supported(&self, py: Python<'_>) -> std::result::Result<(), String> {
-        match self {
-            CpuProfiler::PySpy => Ok(()),
-            CpuProfiler::Ddtrace => {
-                if !native::ddtrace_built() {
-                    return Err(format!(
-                        "cpu_profiler={} is not available in this build (platform {}/{}); \
-                         it is currently built for Linux only, and not for free-threaded \
-                         interpreters",
-                        self.name(),
-                        std::env::consts::OS,
-                        std::env::consts::ARCH,
-                    ));
-                }
-                // It discovers threads by walking the interpreter's thread list
-                // and deriving each thread's CPU clock from the kernel TID in
-                // PyThreadState::native_thread_id, which only exists from
-                // CPython 3.11 on. Without it the thread map stays empty and
-                // the profile would come back blank, so refuse up front.
-                let v = py.version_info();
-                if (v.major, v.minor) < (3, 11) {
-                    return Err(format!(
-                        "cpu_profiler={} requires CPython 3.11 or newer (running {}.{}); \
-                         it needs PyThreadState::native_thread_id to discover threads",
-                        self.name(),
-                        v.major,
-                        v.minor
-                    ));
-                }
-                Ok(())
-            }
+    /// under another's name, and returning "the agent failed to start" would
+    /// not tell the user which knob to turn.
+    pub fn check_supported(
+        &self,
+        py: Python<'_>,
+        sample_rate: u32,
+    ) -> std::result::Result<(), String> {
+        let (CpuProfiler::Ddtrace | CpuProfiler::DdtraceCpuTimer) = *self else {
+            return Ok(());
+        };
+
+        if !native::ddtrace_built() {
+            return Err(format!(
+                "cpu_profiler={} is not available in this build (platform {}/{}); \
+                 it is currently built for Linux only, and not for free-threaded \
+                 interpreters",
+                self.name(),
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+            ));
         }
+
+        // Both modes discover threads by walking the interpreter's thread list
+        // and reading the kernel TID out of PyThreadState::native_thread_id,
+        // which only exists from CPython 3.11 on. Without it the thread map
+        // stays empty and the profile would come back blank, so refuse up front.
+        //
+        // The CPU timer additionally reads the running frame out of a thread
+        // that is executing bytecode, from a signal handler, so it also needs a
+        // frame layout it knows how to walk without the GIL: `instr_ptr` and
+        // `f_executable`/`f_code` on `_PyInterpreterFrame`, plus the
+        // `FRAME_OWNED_BY_*` discriminants. `DD_CPU_TIMER_SUPPORTED` in
+        // `cpp/cpu/ddtrace_stack/src/cpu_timer.cpp` draws that line at 3.12 and
+        // this has to agree with it, because on 3.11 the engine compiles to
+        // no-ops and would report nothing at all.
+        let minimum = match self {
+            CpuProfiler::DdtraceCpuTimer => (3, 12),
+            _ => (3, 11),
+        };
+        let v = py.version_info();
+        if (v.major, v.minor) < minimum {
+            return Err(format!(
+                "cpu_profiler={} requires CPython {}.{} or newer (running {}.{})",
+                self.name(),
+                minimum.0,
+                minimum.1,
+                v.major,
+                v.minor
+            ));
+        }
+
+        // The rest is only knowable at runtime: whether this process already
+        // committed to a CPU accounting mode, and whether the requested rate is
+        // within what the sampler can arm. The native side answers both without
+        // changing anything.
+        if let Some(reason) = native::ddtrace_unsupported_reason(*self, sample_rate) {
+            return Err(reason);
+        }
+        Ok(())
     }
 }
 

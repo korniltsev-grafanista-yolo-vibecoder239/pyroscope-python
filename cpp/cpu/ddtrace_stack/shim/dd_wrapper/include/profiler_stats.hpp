@@ -31,6 +31,8 @@ class ProfilerStats
     template<typename T> void set_greenlet_count(T) {}
     template<typename T> void add_copy_memory_error_count(T) {}
     template<typename T> void add_sample_capture_cpu_time_us(T) {}
+    template<typename T> void add_wall_sample_capture_cpu_time_us(T) {}
+    template<typename T> void add_cpu_timer_drain_cpu_time_us(T) {}
     void increment_sample_count() {}
     void increment_sampling_event_count() {}
 };

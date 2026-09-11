@@ -17,6 +17,12 @@ Local no-op sample/export interfaces are allowed for this milestone. Minimize
 changes to upstream code. Runtime integration and overhead measurements are
 future work. Commit and push changes without creating a pull request.
 
+## Session constraint: no force pushes
+
+Do not force push during this session, including with `--force-with-lease`.
+Only ordinary fast-forward pushes are allowed. If a push would require rewriting
+remote history, stop and report it instead.
+
 ## Document every Datadog patch
 
 Every subsequent change to Datadog-derived source must have an adjacent

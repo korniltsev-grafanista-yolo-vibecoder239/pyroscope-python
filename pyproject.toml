@@ -5,7 +5,7 @@ description = "Pyroscope Python integration"
 authors = [
     {name = "Tolya Korniltsev",email = "anatoly.korniltsev@grafana.com"}
 ]
-license-files = [ "LICENSE" ]
+license-files = [ "LICENSE", "cpp/vendor/dd-trace-py/LICENSE*", "cpp/vendor/dd-trace-py/NOTICE" ]
 license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.10"

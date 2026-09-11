@@ -16,18 +16,22 @@ these directories under `ddtrace/internal/datadog/profiling/`:
   sample/profile management, and upstream upload interface dependencies.
 - `profiling_helpers`: shared Python frame and version compatibility headers.
 
-This is a source-only import. No build files, Python/Cython glue, tests, fuzzers,
-or generated artifacts are imported, and the existing build is unchanged.
+No upstream build files, Python/Cython glue, tests, fuzzers, or generated artifacts
+are imported. Pyroscope's build integration lives outside this tree in
+`cpp/cpu`; it compiles the sampler with local sample/export stubs and links it
+into the native extension without activating it. See root `vendor.md` for the
+build substitutions and any subsequent source patches.
 The upstream wrapper depends on the external libdatadog/native library and its
 generated `datadog/profiling.h`; these are not vendored here. CPython development
 headers and platform/standard-library headers are also external dependencies.
-Compilation and adaptation to Pyroscope's profile backend are future work.
+Adaptation to Pyroscope's profile backend is future work.
 
 `LICENSE`, `LICENSE.Apache`, `LICENSE.BSD3`, and `NOTICE` are unchanged upstream
 files. Echion copyright and MIT notices remain in the source headers.
 `LICENSE.echion` is copied from https://github.com/P403n1x87/echion, Git blob
 `dcc99ea99aebfa474237854d9fede6b576ae51fd`.
 
-`SHA256SUMS` records every imported source/header and license/notice file. Verify
-the copies from this directory with `sha256sum --check SHA256SUMS`; no compilation
-is required.
+`SHA256SUMS` records the original imported source/header and license/notice bytes.
+Verify the copies from this directory with `sha256sum --check SHA256SUMS`.
+Document subsequent deviations in root `vendor.md`; preserve this checksum file
+as the upstream baseline.

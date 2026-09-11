@@ -2,7 +2,11 @@ cmake_minimum_required(VERSION 3.19)
 include(CheckIPOSupported)
 include(FetchContent)
 
-project(_memalloc)
+project(pyroscope_profilers)
+
+# PYROSCOPE_PATCH: cpu-build — CPU compilation is unconditional; memory stays optional.
+option(PYROSCOPE_BUILD_MEMORY "Build the memory profiler" ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,23 +22,26 @@ endif ()
 
 add_compile_definitions(_POSIX_C_SOURCE=200809L)
 
-# Abseil: HeapMapType is backed by absl::flat_hash_map (Swiss Tables). absl is built as
-# static libraries (no BUILD_SHARED_LIBS), position-independent so it can be merged into
-# the final shared Python extension. Tag matches dd-trace-py's pinned version.
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(ABSL_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(ABSL_USE_GOOGLETEST_HEAD OFF CACHE BOOL "" FORCE)
-set(ABSL_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
-set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "" FORCE)
-FetchContent_Declare(
-        absl
-        GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
-        GIT_TAG 20250127.1
-        GIT_SHALLOW TRUE
-        GIT_PROGRESS TRUE)
-FetchContent_MakeAvailable(absl)
+if(PYROSCOPE_BUILD_MEMORY)
+    # Abseil: HeapMapType is backed by absl::flat_hash_map (Swiss Tables). absl is built as
+    # static libraries (no BUILD_SHARED_LIBS), position-independent so it can be merged into
+    # the final shared Python extension. Tag matches dd-trace-py's pinned version.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+    set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
+    set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(ABSL_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(ABSL_USE_GOOGLETEST_HEAD OFF CACHE BOOL "" FORCE)
+    set(ABSL_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
+    set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+            absl
+            GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+            GIT_TAG 20250127.1
+            GIT_SHALLOW TRUE
+            GIT_PROGRESS TRUE)
+    FetchContent_MakeAvailable(absl)
+
+endif()
 
 # Find Python (be flexible about what's available in build environments)
 find_package(Python3 COMPONENTS Interpreter Development)
@@ -54,41 +61,45 @@ if (NOT TARGET Python3::Python)
     message(STATUS "Python3::Python target not found, using include dirs only")
 endif ()
 
-set(SOURCE_FILES _memalloc.cpp _memalloc_tb.cpp _memalloc_heap.cpp _memalloc_reentrant.cpp
-        Pyroscope.h)
+add_subdirectory(cpu)
 
-set(FULL_EXTENSION_NAME "datadog_mem_profiler")
+if(PYROSCOPE_BUILD_MEMORY)
+    set(SOURCE_FILES _memalloc.cpp _memalloc_tb.cpp _memalloc_heap.cpp _memalloc_reentrant.cpp
+            Pyroscope.h)
 
-add_library(${FULL_EXTENSION_NAME} STATIC ${SOURCE_FILES})
+    set(FULL_EXTENSION_NAME "datadog_mem_profiler")
+
+    add_library(${FULL_EXTENSION_NAME} STATIC ${SOURCE_FILES})
 
 
-# Set properties to prevent CMake from adding any prefix or suffix
-#set_target_properties(${FULL_EXTENSION_NAME} PROPERTIES PREFIX "" SUFFIX "")
+    # Set properties to prevent CMake from adding any prefix or suffix
+    #set_target_properties(${FULL_EXTENSION_NAME} PROPERTIES PREFIX "" SUFFIX "")
 
-# Set output directory if specified
-if (DEFINED LIB_INSTALL_DIR)
-    set_target_properties(${FULL_EXTENSION_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${LIB_INSTALL_DIR})
-endif ()
+    # Set output directory if specified
+    if (DEFINED LIB_INSTALL_DIR)
+        set_target_properties(${FULL_EXTENSION_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${LIB_INSTALL_DIR})
+    endif ()
 
-# Include directories
-target_include_directories(
-        ${FULL_EXTENSION_NAME}
-        PRIVATE ${Python3_INCLUDE_DIRS}
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/../rust/include
-)
+    # Include directories
+    target_include_directories(
+            ${FULL_EXTENSION_NAME}
+            PRIVATE ${Python3_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../rust/include
+    )
 
-# Link libraries Python3::Python target might not exist in all build environments (e.g., manylinux) Python modules
-# should use -undefined dynamic_lookup on macOS and not link to libpython on Linux
-if (TARGET Python3::Python AND NOT APPLE)
-    target_link_libraries(${FULL_EXTENSION_NAME} PRIVATE Python3::Python)
-endif ()
+    # Link libraries Python3::Python target might not exist in all build environments (e.g., manylinux) Python modules
+    # should use -undefined dynamic_lookup on macOS and not link to libpython on Linux
+    if (TARGET Python3::Python AND NOT APPLE)
+        target_link_libraries(${FULL_EXTENSION_NAME} PRIVATE Python3::Python)
+    endif ()
 
-# Compile against absl::flat_hash_map (brings in include dirs and records absl as a link
-# dependency). Since this is a STATIC library, the absl object code is not archived in here;
-# we merge it explicitly via bundle_static_library below.
-target_link_libraries(${FULL_EXTENSION_NAME} PRIVATE absl::flat_hash_map)
+    # Compile against absl::flat_hash_map (brings in include dirs and records absl as a link
+    # dependency). Since this is a STATIC library, the absl object code is not archived in here;
+    # we merge it explicitly via bundle_static_library below.
+    target_link_libraries(${FULL_EXTENSION_NAME} PRIVATE absl::flat_hash_map)
 
-include(${CMAKE_CURRENT_SOURCE_DIR}/BundleStaticLibrary.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/BundleStaticLibrary.cmake)
 
-bundle_static_library(${FULL_EXTENSION_NAME} ${FULL_EXTENSION_NAME}_bundled)
+    bundle_static_library(${FULL_EXTENSION_NAME} ${FULL_EXTENSION_NAME}_bundled)
+endif()

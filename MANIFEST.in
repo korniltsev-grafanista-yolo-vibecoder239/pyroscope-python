@@ -8,3 +8,11 @@ include cpp/BundleStaticLibrary.cmake
 recursive-include cpp/ *.h
 recursive-include cpp/ *.cpp
 recursive-include cpp/ *.hpp
+
+recursive-include cpp/ *.cc
+recursive-include cpp/ CMakeLists.txt *.cmake
+include vendor.md
+include cpp/vendor/dd-trace-py/README.md
+include cpp/vendor/dd-trace-py/SHA256SUMS
+include cpp/vendor/dd-trace-py/LICENSE*
+include cpp/vendor/dd-trace-py/NOTICE

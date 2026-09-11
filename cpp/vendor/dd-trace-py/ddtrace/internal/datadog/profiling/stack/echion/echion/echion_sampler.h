@@ -1,0 +1,205 @@
+#pragma once
+
+#define PY_SSIZE_T_CLEAN
+#define Py_BUILD_CORE
+#include <Python.h>
+
+#include <cstdint>
+#include <optional>
+#include <random>
+#include <unordered_map>
+#include <unordered_set>
+
+#include <echion/cache.h>
+#include <echion/frame.h>
+#include <echion/strings.h>
+#include <echion/threads.h>
+
+#include "constants.hpp"
+#include "stack_renderer.hpp"
+
+// Forward declaration
+class Frame;
+
+// Identity of the frame that separates the asyncio machinery from the pure Python stack.
+// We memoize the interned name and filename rather than a Frame cache key: the cache key
+// mixes in the bytecode offset, so it only matches the boundary frame while it sits on the
+// very instruction it happened to be on when we first identified it.
+struct BoundaryFrame
+{
+    StringTable::Key name = 0;
+    StringTable::Key filename = 0;
+};
+
+class EchionSampler
+{
+    // Thread Info map (Thread ID -> ThreadInfo)
+    std::unordered_map<uintptr_t, ThreadInfo::Ptr> thread_info_map_;
+    std::mutex thread_info_map_lock_;
+
+    // Task Link maps (Task -> Task relationships)
+    std::unordered_map<PyObject*, PyObject*> task_link_map_;
+    std::unordered_map<PyObject*, PyObject*> weak_task_link_map_;
+    std::mutex task_link_map_lock_;
+
+    // Greenlet maps
+    std::unordered_map<GreenletInfo::ID, GreenletInfo::Ptr> greenlet_info_map_;
+    std::unordered_map<GreenletInfo::ID, GreenletInfo::ID> greenlet_parent_map_;
+    std::unordered_map<uintptr_t, GreenletInfo::ID> greenlet_thread_map_;
+    std::mutex greenlet_info_map_lock_;
+
+    // Asyncio state
+    PyObject* asyncio_scheduled_tasks_ = nullptr;
+    PyObject* asyncio_eager_tasks_ = nullptr;
+
+    // Task unwinding state
+    std::optional<BoundaryFrame> asyncio_boundary_frame_;
+    std::optional<BoundaryFrame> uvloop_boundary_frame_;
+    std::unordered_set<PyObject*> previous_task_objects_;
+
+    // Sampling-thread scratch buffer. Only the single sampling thread
+    // (Sampler::sampling_thread) touches this. unwind_frame clears it on
+    // entry; reusing the hash table across calls eliminates per-call
+    // allocator churn.
+    std::unordered_set<PyObject*> seen_frames_scratch_;
+
+    // This GC frame is sample-local ambient state. Nested scopes
+    // intentionally suppress it while suspended greenlet stacks are unwound.
+    // The pointer is borrowed and used as an address only by the sampling thread.
+    PyObject* current_gc_frame_ = nullptr;
+
+    // Accumulated asyncio task count across sampled threads in the current sampling cycle.
+    // When thread subsampling is enabled (_DD_PROFILING_STACK_MAX_THREADS), this only
+    // reflects tasks from the sampled subset, not all threads in the process.
+    // Only accessed from the sampling thread, so no lock/atomic is needed.
+    size_t asyncio_task_count_ = 0;
+
+    // Maximum number of leaf tasks / greenlets to unwind and emit per cycle.
+    // 0 means unlimited.
+    unsigned int max_tasks_per_sample_ = g_default_max_tasks_per_sample;
+
+    // RNG used for task / greenlet reservoir sampling.
+    std::minstd_rand rng_{ std::random_device{}() };
+
+    // Caches
+    StringTable string_table_;
+    LRUCache<uintptr_t, Frame> frame_cache_;
+
+    // Stack renderer for outputting samples
+    Datadog::StackRenderer renderer_;
+
+  public:
+    class GCFrameScope
+    {
+        EchionSampler& echion_;
+        PyObject* previous_;
+
+      public:
+        GCFrameScope(EchionSampler& echion, PyObject* frame)
+          : echion_(echion)
+          , previous_(echion.current_gc_frame_)
+        {
+            echion_.current_gc_frame_ = frame;
+        }
+
+        ~GCFrameScope() { echion_.current_gc_frame_ = previous_; }
+
+        GCFrameScope(const GCFrameScope&) = delete;
+        GCFrameScope& operator=(const GCFrameScope&) = delete;
+    };
+
+    EchionSampler(size_t frame_cache_capacity = 1024)
+      : frame_cache_(frame_cache_capacity)
+    {
+    }
+    ~EchionSampler() = default;
+
+    Datadog::StackRenderer& renderer() { return renderer_; }
+
+    std::unordered_map<uintptr_t, ThreadInfo::Ptr>& thread_info_map() { return thread_info_map_; }
+    std::mutex& thread_info_map_lock() { return thread_info_map_lock_; }
+
+    std::unordered_map<PyObject*, PyObject*>& task_link_map() { return task_link_map_; }
+    std::unordered_map<PyObject*, PyObject*>& weak_task_link_map() { return weak_task_link_map_; }
+    std::mutex& task_link_map_lock() { return task_link_map_lock_; }
+
+    std::unordered_map<GreenletInfo::ID, GreenletInfo::Ptr>& greenlet_info_map() { return greenlet_info_map_; }
+    std::unordered_map<GreenletInfo::ID, GreenletInfo::ID>& greenlet_parent_map() { return greenlet_parent_map_; }
+    std::unordered_map<uintptr_t, GreenletInfo::ID>& greenlet_thread_map() { return greenlet_thread_map_; }
+    std::mutex& greenlet_info_map_lock() { return greenlet_info_map_lock_; }
+
+    PyObject* asyncio_scheduled_tasks() const { return asyncio_scheduled_tasks_; }
+    PyObject* asyncio_eager_tasks() const { return asyncio_eager_tasks_; }
+
+    void init_asyncio(PyObject* scheduled_tasks, PyObject* eager_tasks)
+    {
+        asyncio_scheduled_tasks_ = scheduled_tasks;
+        asyncio_eager_tasks_ = (eager_tasks != Py_None) ? eager_tasks : nullptr;
+    }
+
+    std::optional<BoundaryFrame>& asyncio_boundary_frame() { return asyncio_boundary_frame_; }
+    std::optional<BoundaryFrame>& uvloop_boundary_frame() { return uvloop_boundary_frame_; }
+    std::unordered_set<PyObject*>& previous_task_objects() { return previous_task_objects_; }
+
+    std::unordered_set<PyObject*>& seen_frames_scratch() { return seen_frames_scratch_; }
+
+    PyObject* current_gc_frame() const { return current_gc_frame_; }
+    [[nodiscard]] GCFrameScope use_gc_frame(PyObject* frame) { return GCFrameScope(*this, frame); }
+
+    void reset_asyncio_task_count() { asyncio_task_count_ = 0; }
+    void add_asyncio_task_count(size_t count) { asyncio_task_count_ += count; }
+    size_t asyncio_task_count() const { return asyncio_task_count_; }
+
+    unsigned int max_tasks_per_sample() const { return max_tasks_per_sample_; }
+    void set_max_tasks_per_sample(unsigned int value) { max_tasks_per_sample_ = value; }
+
+    std::minstd_rand& rng() { return rng_; }
+
+    // Accessor for StringTable operations
+    StringTable& string_table() { return string_table_; }
+    const StringTable& string_table() const { return string_table_; }
+
+    // Accessor for frame cache operations
+    LRUCache<uintptr_t, Frame>& frame_cache() { return frame_cache_; }
+
+    void postfork_child()
+    {
+        // Re-init mutexes (placement new to avoid UB)
+        new (&thread_info_map_lock_) std::mutex;
+        new (&task_link_map_lock_) std::mutex;
+        new (&greenlet_info_map_lock_) std::mutex;
+
+        // Reset string_table mutex
+        string_table_.postfork_child();
+
+        // Reset frame cache. Use postfork_child (placement new) instead of std::list::clear
+        // because the Sampling Thread may have been modifying the cache when fork
+        // took its snapshot. Traversing a corrupted list to free nodes would crash.
+        frame_cache_.postfork_child();
+
+        // Also use placement new for all containers touched by the sampling thread.
+        // Using placement new means the existing containers are abandoned and
+        // their memory leaked in the child and we may lose some data (e.g. relationships
+        // between asyncio Tasks).
+        // However, this is the only way to safely continue working after fork.
+        new (&thread_info_map_) std::unordered_map<uintptr_t, ThreadInfo::Ptr>();
+        new (&task_link_map_) std::unordered_map<PyObject*, PyObject*>();
+        new (&weak_task_link_map_) std::unordered_map<PyObject*, PyObject*>();
+        new (&greenlet_info_map_) std::unordered_map<GreenletInfo::ID, GreenletInfo::Ptr>();
+        new (&greenlet_parent_map_) std::unordered_map<GreenletInfo::ID, GreenletInfo::ID>();
+        new (&greenlet_thread_map_) std::unordered_map<uintptr_t, GreenletInfo::ID>();
+        new (&previous_task_objects_) std::unordered_set<PyObject*>();
+
+        asyncio_boundary_frame_.reset();
+        uvloop_boundary_frame_.reset();
+        asyncio_task_count_ = 0;
+        rng_ = std::minstd_rand{ std::random_device{}() };
+
+        new (&seen_frames_scratch_) std::unordered_set<PyObject*>();
+        current_gc_frame_ = nullptr;
+
+        // Clear renderer caches to avoid using stale interned IDs from the
+        // parent's Profiles Dictionary
+        renderer_.postfork_child();
+    }
+};

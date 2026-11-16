@@ -2,6 +2,8 @@
 
 pub const PY_VERSION: (u8, u8) = (3, 15);
 pub const OB_TYPE: usize = 8;
+pub const THREAD_STATUS: usize = 32;
+pub const THREAD_FINALIZING: usize = 32;
 pub const THREAD_FRAME: usize = 72;
 pub const EXECUTABLE: usize = 0;
 pub const EXECUTABLE_TAG_BITS: usize = 3;

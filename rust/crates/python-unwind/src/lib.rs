@@ -8,10 +8,26 @@
 //! not establish lifetime or object identity; deferred reads can observe reused or changing memory.
 //!
 //! Initialize kindasafe recovery, invoke [`handler`] from a `SIGPROF` callback, and drain with [`consumer`].
+//! On 3.15, first start a `bindings` epoch and maintain it with normal-thread Python
+//! execution callbacks. The SDK uses an independent `sys.monitoring` tool for this.
 //! Each record contains the interrupted thread's frames, innermost first, and its sampling-period count.
 //!
-//! Supports CPython 3.10 to 3.14, default (GIL) build, 64-bit targets. The offsets come from the
+//! Supports CPython 3.10 to 3.15, default (GIL) build, main interpreter on 64-bit
+//! x86-64/ARM64 Linux and macOS. Indexed `Py_STACKREF_DEBUG` builds are rejected.
+//! The offsets come from the
 //! checked-in layouts verified against the target CPython headers by `pyroscope-python-offsets`.
+//!
+//! On 3.15 SIGPROF reads a profiler-owned pthread slot populated by execution events,
+//! without calling CPython TLS getters or searching interpreter/thread lists. Last-frame
+//! return/yield/unwind events clear the slot before leaving Python, independently of
+//! thread dictionaries retained by native extensions. pthread teardown releases the slot. Session
+//! epochs reject bindings left across stops. No Python execution event since startup
+//! means no binding: samples of already-running native work are lost until Python resumes.
+//! Execution-event overhead is paid by the application, including on unsampled lines.
+//! The tool registration and entry/exit event delivery must remain intact. Native code
+//! must not suppress monitoring across a last-frame exit. Manually
+//! swapping/migrating live states between native threads is unsupported. Binding
+//! invalidation does not make concurrent foreign mutation/deletion of active frames safe.
 //!
 //! Native reads rely on CPython's current-thread ownership of the active frame chain: the
 //! interrupted thread is paused, active frames retain their code, and other threads must not
@@ -31,6 +47,12 @@
 
 #[cfg(test)]
 extern crate std;
+
+#[cfg(Py_3_15)]
+extern crate alloc;
+
+#[cfg(Py_3_15)]
+pub mod bindings;
 
 use pyroscope_python_offsets as layout;
 use pyroscope_ringbuffer::{Consumer, RingBuffer};
@@ -55,14 +77,13 @@ const SKIP_OWNERS: u8 = 1 << layout::FRAME_OWNED_BY_CSTACK;
 #[cfg(all(Py_3_14, not(Py_3_15)))]
 const SKIP_OWNERS: u8 =
     (1 << layout::FRAME_OWNED_BY_CSTACK) | (1 << layout::FRAME_OWNED_BY_INTERPRETER);
-// CPython 3.15 removed C-stack-owned frames. Keep the crate buildable for the
-// other profilers; Signal startup still rejects 3.15 before installing a timer.
+// CPython 3.15 removed the C-stack owner value; base/entry sentinels are interpreter-owned.
 #[cfg(Py_3_15)]
 const SKIP_OWNERS: u8 = 1 << layout::FRAME_OWNED_BY_INTERPRETER;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// The calling thread has no Python thread state.
+    /// No eligible execution binding (or no Python thread state on older versions).
     NoThreadState,
     /// Memory on the chain was unreadable.
     Read,
@@ -126,9 +147,13 @@ fn record_stack(frames: &[Frame], metadata: SampleMetadata) {
 
 #[inline(always)]
 fn current_thread_state() -> usize {
-    // TODO: PyGILState_GetThisThreadState is not safe on 3.15; find another way to get the tstate.
+    #[cfg(Py_3_15)]
+    return bindings::current();
+    #[cfg(not(Py_3_15))]
     // SAFETY: this queries the calling thread's state without requiring the GIL.
-    unsafe { pyo3_ffi::PyGILState_GetThisThreadState() as usize }
+    unsafe {
+        pyo3_ffi::PyGILState_GetThisThreadState() as usize
+    }
 }
 
 #[derive(Default)]
@@ -173,6 +198,8 @@ impl Metrics {
 /// Recovery initialization must have succeeded and both fault signals must be deliverable on this thread
 /// throughout the walk. These caller preconditions are not checked at runtime; a failed
 /// memory read can crash the process if they are violated.
+/// On 3.15, a binding epoch and its entry/exit event protocol must also be active,
+/// as described in the crate docs. The unwinder does not initialize that protocol.
 ///
 /// An executable whose type is not `PyCode_Type` fails the entire stack.
 /// [`MAX_FRAMES`] bounds the walk, skipped frames included.
@@ -209,6 +236,10 @@ fn current_frame(tstate: usize) -> Result<usize, Error> {
 }
 
 fn walk(tstate: usize, frames: &mut [Frame]) -> Result<&[Frame], Error> {
+    #[cfg(Py_3_15)]
+    if read_u32(tstate, layout::THREAD_STATUS)? as usize & layout::THREAD_FINALIZING != 0 {
+        return Err(Error::NoThreadState);
+    }
     let code_type = (&raw mut pyo3_ffi::PyCode_Type) as usize;
     let mut frame = current_frame(tstate)?;
     let mut visited = 0;
@@ -222,7 +253,7 @@ fn walk(tstate: usize, frames: &mut [Frame]) -> Result<&[Frame], Error> {
         #[cfg(Py_3_12)]
         {
             let owner = read_u8(frame, layout::OWNER)?;
-            if SKIP_OWNERS & (1 << owner) != 0 {
+            if SKIP_OWNERS & 1u8.checked_shl(owner.into()).unwrap_or(0) != 0 {
                 frame = previous;
                 continue;
             }
@@ -255,7 +286,7 @@ fn read_u8(base: usize, offset: usize) -> Result<u8, Error> {
     unsafe { kindasafe::u8(addr as u64) }.map_err(|_| Error::Read)
 }
 
-#[cfg(not(Py_3_11))]
+#[cfg(any(not(Py_3_11), Py_3_15))]
 #[inline(always)]
 fn read_u32(base: usize, offset: usize) -> Result<u32, Error> {
     let addr = base.wrapping_add(offset);

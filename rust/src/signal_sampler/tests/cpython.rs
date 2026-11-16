@@ -168,6 +168,8 @@ fn resolves_real_cpython_stack_shapes() {
     Python::initialize();
     // SAFETY: these tests preserve recovery handlers throughout all walks.
     unsafe { kindasafe_init::init() }.unwrap();
+    #[cfg(Py_3_15)]
+    let _monitor = super::monitoring::Monitor::start().unwrap();
     Python::attach(|py| {
         let foreign = module(py, FOREIGN_SOURCE, FOREIGN_FILENAME, "resolver_foreign");
         for (index, filename) in ["frames.py", "frames_é.py", "frames_中.py", "frames_🐍.py"]

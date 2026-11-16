@@ -22,6 +22,10 @@
 #include <internal/pycore_frame.h>
 #endif
 
+#ifdef Py_STACKREF_DEBUG
+#error "Signal requires pointer-based stack references, not Py_STACKREF_DEBUG indices"
+#endif
+
 static FILE *out;
 
 static void print_usize(const char *name, size_t value) {
@@ -55,6 +59,14 @@ static uint64_t state_word(const PyASCIIObject *object) {
 static void write_layouts(void) {
     fprintf(out, "pub const PY_VERSION: (u8, u8) = (%d, %d);\n", PY_MAJOR_VERSION, PY_MINOR_VERSION);
     print_usize("OB_TYPE", offsetof(PyObject, ob_type));
+#if PY_VERSION_HEX >= 0x030f0000
+    print_usize("THREAD_STATUS", offsetof(PyThreadState, _status));
+    PyThreadState thread = {0};
+    thread._status.finalizing = 1;
+    uint32_t status;
+    memcpy(&status, &thread._status, sizeof(status));
+    print_usize("THREAD_FINALIZING", status);
+#endif
 #if PY_VERSION_HEX < 0x030b0000
     print_usize("THREAD_FRAME", offsetof(PyThreadState, frame));
 #elif PY_VERSION_HEX < 0x030d0000

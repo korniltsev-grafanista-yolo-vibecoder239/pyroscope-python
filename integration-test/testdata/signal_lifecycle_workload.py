@@ -149,6 +149,46 @@ def bounded_drain():
             thread.join()
 
 
+def monitoring_ownership():
+    assert sys.version_info >= (3, 15)
+    monitoring = sys.monitoring
+    assert all(monitoring.get_tool(i) is None for i in range(6))
+    # Saturation is a startup error, without disturbing the existing six tools.
+    for i in range(6):
+        monitoring.use_tool_id(i, f"other-{i}")
+    assert not configure()
+    assert [monitoring.get_tool(i) for i in range(6)] == [
+        f"other-{i}" for i in range(6)
+    ]
+    for i in range(1, 6):
+        monitoring.free_tool_id(i)
+    observed = []
+
+    def other_callback(code, offset):
+        if code is probe.__code__:
+            observed.append(offset)
+
+    def probe():
+        return 42
+
+    event = monitoring.events.PY_START
+    monitoring.register_callback(0, event, other_callback)
+    monitoring.set_events(0, event)
+    for _ in range(3):
+        assert configure()
+        assert sum(monitoring.get_tool(i) == "pyroscope.signal" for i in range(6)) == 1
+        assert probe() == 42
+        assert pyroscope.shutdown()
+        assert monitoring.get_tool(0) == "other-0"
+        assert monitoring.get_events(0) == event
+        assert all(monitoring.get_tool(i) is None for i in range(1, 6))
+        assert probe() == 42
+    assert len(observed) == 6, observed
+    monitoring.set_events(0, 0)
+    monitoring.register_callback(0, event, None)
+    monitoring.free_tool_id(0)
+
+
 def fault_fallback_child():
     signum = int(os.environ["FALLBACK_SIGNAL"])
     ignored = os.environ["FALLBACK_IGNORED"] == "1"

@@ -57,11 +57,12 @@ jobs:
         working-directory: rust
 
   test:
-    name: cargo test (${{ matrix.arch.name }})
+    name: cargo test (${{ matrix.arch.name }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.arch.runner }}
     strategy:
       fail-fast: false
       matrix:
+        python: ["3.10", "3.14", "3.15"]
         arch:
           - name: x64
             runner: ${{ github.repository_owner == 'grafana' && 'ubuntu-x64-small' || 'ubuntu-latest' }}
@@ -77,12 +78,40 @@ jobs:
         with:
           toolchain: 1.99.1
 
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
       - name: Run tests
+        env:
+          PYO3_PYTHON: python3
         run: |
           export Python3_ROOT_DIR=$(python3 -c 'import sys, pathlib; print(pathlib.Path(sys.base_prefix).resolve())')
           export Python3_EXECUTABLE=$(python3 -c 'import sys; print(sys.executable)')
           cargo test --locked --workspace
           cargo test --manifest-path ../kindasafe/Cargo.toml --locked --workspace
+        working-directory: rust
+
+  macos-signal:
+    name: CPython 3.15 Signal (macOS)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.99.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.15"
+      - name: Run Signal lifetime and stack tests
+        run: |
+          export PYO3_PYTHON=$(python3 -c 'import sys; print(sys.executable)')
+          export Python3_EXECUTABLE="$PYO3_PYTHON"
+          export Python3_ROOT_DIR=$(python3 -c 'import sys; print(sys.base_prefix)')
+          cargo test --locked --lib signal_sampler -- --test-threads=1
         working-directory: rust
 
   miri:

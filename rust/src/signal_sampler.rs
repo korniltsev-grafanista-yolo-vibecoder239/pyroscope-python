@@ -21,6 +21,9 @@ use pyroscope_signal_timer as timer;
 use pyroscope_python_resolve as resolve;
 pub use resolve::Lines;
 
+#[cfg(Py_3_15)]
+mod monitoring;
+
 extern "C" fn signal_handler(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
     // SAFETY: SignalHandler installs this callback with SA_SIGINFO, so the kernel
     // supplies a valid siginfo_t for the duration of the callback.
@@ -67,9 +70,9 @@ pub(super) static METRICS_LOCK: Mutex<()> = Mutex::new(());
 
 fn check_version(version: (u8, u8)) -> Result<(), Error> {
     let (major, minor) = version;
-    if !matches!(version, (3, 10..=14)) {
+    if !matches!(version, (3, 10..=15)) {
         return Err(format!(
-            "unwinding in the signal handler supports only Python 3.10 to 3.14, found {major}.{minor}"
+            "unwinding in the signal handler supports only Python 3.10 to 3.15, found {major}.{minor}"
         ));
     }
     if version != unwind::PY_VERSION {
@@ -90,6 +93,8 @@ pub struct SignalHandlerSession {
     timer: SharedTimer,
     // Dropped after the timer, see the `Drop` impl.
     _handler: SignalHandler,
+    #[cfg(Py_3_15)]
+    _monitor: monitoring::Monitor,
     buf: Vec<Frame>,
     resolver: resolve::Resolver<resolve::PYO3Types>,
 }
@@ -106,6 +111,8 @@ impl SignalHandlerSession {
         // callbacks compatible and loaded, as documented in README.md and the unwinder.
         unsafe { kindasafe_init::init() }
             .map_err(|error| format!("failed to install memory fault handlers: {error:?}"))?;
+        #[cfg(Py_3_15)]
+        let monitor = monitoring::Monitor::start()?;
         let resolver = resolve::Resolver::new(config.lines);
 
         // Discard what a previous session left behind.
@@ -131,6 +138,8 @@ impl SignalHandlerSession {
         Ok(SignalHandlerSession {
             timer: Arc::new(Mutex::new(Some(timer))),
             _handler: signal_handler,
+            #[cfg(Py_3_15)]
+            _monitor: monitor,
             buf,
             resolver,
         })
@@ -187,6 +196,10 @@ pub fn thread_removed(timer: &SharedTimer, tid: timer::pid_t) {
     }
 }
 
-#[cfg(all(test, not(miri), not(Py_3_15)))]
+#[cfg(all(test, not(miri)))]
 #[path = "signal_sampler/tests/cpython.rs"]
 mod cpython_tests;
+
+#[cfg(all(test, not(miri), Py_3_15))]
+#[path = "signal_sampler/tests/bindings.rs"]
+mod binding_tests;

@@ -10,7 +10,12 @@
 //! Initialize kindasafe recovery, invoke [`handler`] from a `SIGPROF` callback, and drain with [`consumer`].
 //! Each record contains the interrupted thread's frames, innermost first, and its sampling-period count.
 //!
-//! Supports CPython 3.10 to 3.14, default (GIL) build, 64-bit targets. The offsets come from the
+//! Supports CPython 3.10 to 3.15, default (GIL) build, 64-bit targets, main interpreter only.
+//! On 3.15 successfully call `prepare_thread_lookup` on a normal Python thread before sampling;
+//! libpython and the main interpreter must outlive sampling. Linux requires the Python
+//! executable's TLS or a direct startup dependency's TLS (glibc or musl); dlopen-loaded
+//! libpython is unsupported. macOS supports Darwin's original and v2 TLV descriptors.
+//! Subinterpreters are unsupported. The offsets come from the
 //! checked-in layouts verified against the target CPython headers by `pyroscope-python-offsets`.
 //!
 //! Native reads rely on CPython's current-thread ownership of the active frame chain: the
@@ -39,6 +44,11 @@ pub use layout::{OB_TYPE, PY_VERSION};
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(Py_3_15)]
+mod thread_state;
+#[cfg(Py_3_15)]
+pub use thread_state::{PrepareError as ThreadLookupError, prepare as prepare_thread_lookup};
+
 /// Maximum number of frames visited in one stack, including skipped frames.
 pub const MAX_FRAMES: usize = 256;
 
@@ -55,8 +65,8 @@ const SKIP_OWNERS: u8 = 1 << layout::FRAME_OWNED_BY_CSTACK;
 #[cfg(all(Py_3_14, not(Py_3_15)))]
 const SKIP_OWNERS: u8 =
     (1 << layout::FRAME_OWNED_BY_CSTACK) | (1 << layout::FRAME_OWNED_BY_INTERPRETER);
-// CPython 3.15 removed C-stack-owned frames. Keep the crate buildable for the
-// other profilers; Signal startup still rejects 3.15 before installing a timer.
+// CPython 3.15 removed C-stack-owned frames; its interpreter-owned sentinel
+// frames must still be skipped, including across C-to-Python reentry.
 #[cfg(Py_3_15)]
 const SKIP_OWNERS: u8 = 1 << layout::FRAME_OWNED_BY_INTERPRETER;
 
@@ -68,7 +78,7 @@ pub enum Error {
     Read,
     /// A Python frame's executable was null or was not a code object.
     InvalidCodeType,
-    /// The output slice has no room, or the chain exceeds [`MAX_FRAMES`] (including loops).
+    /// The output slice has no room or the frame chain exceeds [`MAX_FRAMES`] (including loops).
     Truncated,
 }
 
@@ -104,7 +114,7 @@ pub fn handler(metadata: SampleMetadata) {
     // TODO: consider MaybeUninit for frame storage after measuring the initialization cost.
     let mut frames = [Frame::default(); MAX_FRAMES];
     // Unwind errors are counted by the unwinder. Never publish a partial stack.
-    let Ok(frames) = unwind_thread(current_thread_state(), &mut frames, metadata.count) else {
+    let Ok(frames) = unwind_current(&mut frames, metadata.count) else {
         return;
     };
     record_stack(frames, metadata);
@@ -125,10 +135,12 @@ fn record_stack(frames: &[Frame], metadata: SampleMetadata) {
 }
 
 #[inline(always)]
-fn current_thread_state() -> usize {
-    // TODO: PyGILState_GetThisThreadState is not safe on 3.15; find another way to get the tstate.
+fn current_thread_state() -> Result<usize, Error> {
+    #[cfg(Py_3_15)]
+    return thread_state::current();
+    #[cfg(not(Py_3_15))]
     // SAFETY: this queries the calling thread's state without requiring the GIL.
-    unsafe { pyo3_ffi::PyGILState_GetThisThreadState() as usize }
+    Ok(unsafe { pyo3_ffi::PyGILState_GetThisThreadState() as usize })
 }
 
 #[derive(Default)]
@@ -179,8 +191,15 @@ impl Metrics {
 /// Writes the calling thread's frames into `frames`, innermost first, and returns that subslice.
 /// On error, the caller must discard the partial stack.
 /// Unwind errors are counted here; publishing the stack is the caller's responsibility.
+/// On CPython 3.15 `prepare_thread_lookup` must have succeeded before any walk;
+/// libpython and the main interpreter must remain alive. These preconditions are not checked.
 pub fn unwind(frames: &mut [Frame]) -> Result<&[Frame], Error> {
-    unwind_thread(current_thread_state(), frames, 1)
+    unwind_current(frames, 1)
+}
+
+fn unwind_current(frames: &mut [Frame], count: usize) -> Result<&[Frame], Error> {
+    let tstate = current_thread_state().inspect_err(|error| count_error(error, count))?;
+    unwind_thread(tstate, frames, count)
 }
 
 fn unwind_thread(tstate: usize, frames: &mut [Frame], count: usize) -> Result<&[Frame], Error> {
@@ -189,15 +208,17 @@ fn unwind_thread(tstate: usize, frames: &mut [Frame], count: usize) -> Result<&[
     } else {
         walk(tstate, frames)
     };
-    result.inspect_err(|error| {
-        let counter = match error {
-            Error::NoThreadState => &METRICS.no_thread_state,
-            Error::InvalidCodeType => &METRICS.invalid_code_type,
-            Error::Read => &METRICS.read_errors,
-            Error::Truncated => &METRICS.truncated,
-        };
-        counter.fetch_add(count, Ordering::Relaxed);
-    })
+    result.inspect_err(|error| count_error(error, count))
+}
+
+fn count_error(error: &Error, count: usize) {
+    let counter = match error {
+        Error::NoThreadState => &METRICS.no_thread_state,
+        Error::InvalidCodeType => &METRICS.invalid_code_type,
+        Error::Read => &METRICS.read_errors,
+        Error::Truncated => &METRICS.truncated,
+    };
+    counter.fetch_add(count, Ordering::Relaxed);
 }
 
 #[inline(always)]
@@ -222,7 +243,7 @@ fn walk(tstate: usize, frames: &mut [Frame]) -> Result<&[Frame], Error> {
         #[cfg(Py_3_12)]
         {
             let owner = read_u8(frame, layout::OWNER)?;
-            if SKIP_OWNERS & (1 << owner) != 0 {
+            if owner < u8::BITS as u8 && SKIP_OWNERS & (1 << owner) != 0 {
                 frame = previous;
                 continue;
             }
@@ -426,6 +447,15 @@ mod tests {
         let mut inner = [0usize; 16];
         set(&mut inner, layout::EXECUTABLE, code_addr);
         set(&mut inner, layout::PREVIOUS, outer.as_ptr() as usize);
+        #[cfg(Py_3_12)]
+        // Treat an untrusted owner byte as data, never as an unchecked shift.
+        unsafe {
+            inner
+                .as_mut_ptr()
+                .cast::<u8>()
+                .add(layout::OWNER)
+                .write(255)
+        };
         let frame = inner.as_ptr() as usize;
         #[cfg(all(Py_3_11, not(Py_3_13)))]
         let mut cframe = [0usize; 4];

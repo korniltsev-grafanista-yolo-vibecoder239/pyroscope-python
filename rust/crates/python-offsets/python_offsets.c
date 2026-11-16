@@ -18,6 +18,9 @@
 #elif PY_VERSION_HEX >= 0x030e0000
 #include <internal/pycore_interpframe_structs.h>
 #include <internal/pycore_stackref.h>
+#ifdef Py_STACKREF_DEBUG
+#error "the Signal profiler requires pointer-based stackrefs; Py_STACKREF_DEBUG is unsupported"
+#endif
 #else
 #include <internal/pycore_frame.h>
 #endif

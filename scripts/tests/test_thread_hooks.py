@@ -13,7 +13,7 @@ def load_hooks():
     native = types.ModuleType("pyroscope._native")
     native.LineNo = types.SimpleNamespace(LastInstruction=0)
     native.ProfilerImplementation = types.SimpleNamespace(PySpy=0)
-    native.SignalTimer = types.SimpleNamespace(ITimer=0)
+    native.SignalTimer = types.SimpleNamespace(ITimer=0, CTimer=1)
     path = Path(__file__).resolve().parents[2] / "python/pyroscope/__init__.py"
     spec = importlib.util.spec_from_file_location(
         "pyroscope", path, submodule_search_locations=[str(path.parent)]

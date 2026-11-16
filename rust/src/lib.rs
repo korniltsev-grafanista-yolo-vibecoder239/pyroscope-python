@@ -334,7 +334,8 @@ pub enum ProfilerImplementation {
     PySpy = 0,
     Stack = 1,
     /// Experimental: unwinds the python stack of the thread on the CPU inside a `SIGPROF`
-    /// handler. CPython 3.11 to 3.14 only, no thread ids, names or line numbers.
+    /// handler. CPython 3.10 to 3.15, GIL builds and main interpreter only;
+    /// no thread ids or names. Supports all LineNo modes.
     Signal = 2,
 }
 

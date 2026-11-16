@@ -166,6 +166,9 @@ fn module<'py>(py: Python<'py>, source: &str, filename: &str, name: &str) -> Bou
 fn resolves_real_cpython_stack_shapes() {
     let _guard = crate::signal_sampler::METRICS_LOCK.lock().unwrap();
     Python::initialize();
+    #[cfg(Py_3_15)]
+    // SAFETY: the embedded interpreter remains alive for the rest of the process.
+    unsafe { unwind::prepare_thread_lookup() }.unwrap();
     // SAFETY: these tests preserve recovery handlers throughout all walks.
     unsafe { kindasafe_init::init() }.unwrap();
     Python::attach(|py| {
@@ -342,4 +345,152 @@ fn resolves_real_cpython_stack_shapes() {
             }
         }
     });
+}
+
+#[cfg(Py_3_15)]
+#[test]
+fn fresh_native_thread_does_not_inherit_abandoned_python_state() {
+    const CHILD: &str = "PYROSCOPE_TEST_TLS_REUSE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Intentionally abandoned C-API state belongs only to this subprocess.
+        // The embedded interpreter is never finalized; process exit reclaims it.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "signal_sampler::cpython_tests::fresh_native_thread_does_not_inherit_abandoned_python_state", "--nocapture"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let _guard = crate::signal_sampler::METRICS_LOCK.lock().unwrap();
+    Python::initialize();
+    unsafe { kindasafe_init::init() }.unwrap();
+    unsafe { unwind::prepare_thread_lookup() }.unwrap();
+
+    let (abandoned, old_id) = std::thread::spawn(|| unsafe {
+        // Deliberately omit PyGILState_Release. PyEval_SaveThread releases the
+        // GIL but leaves a linked, bound state when the OS thread exits.
+        pyo3::ffi::PyGILState_Ensure();
+        let bound = pyo3::ffi::PyGILState_GetThisThreadState() as usize;
+        let saved = pyo3::ffi::PyEval_SaveThread() as usize;
+        assert_eq!(bound, saved);
+        (bound, libc::pthread_self() as usize)
+    })
+    .join()
+    .unwrap();
+    let still_linked = || {
+        Python::attach(|_| unsafe {
+            let mut state =
+                pyo3::ffi::PyInterpreterState_ThreadHead(pyo3::ffi::PyInterpreterState_Main());
+            while !state.is_null() {
+                if state as usize == abandoned {
+                    return true;
+                }
+                state = pyo3::ffi::PyThreadState_Next(state);
+            }
+            false
+        })
+    };
+    assert!(
+        still_linked(),
+        "abandoned state {abandoned:#x} was not retained"
+    );
+    unwind::METRICS.take_drop_counts();
+    let _handler =
+        pyroscope_signal_timer::SignalHandler::install(libc::SIGPROF, super::signal_handler)
+            .unwrap();
+    let mut reused = None;
+    for _ in 0..256 {
+        let observation = std::thread::spawn(move || {
+            // This thread NEVER calls a Python API, even for the test oracle.
+            // Joining the previous thread permits pthread/stack-cache reuse.
+            let id = unsafe { libc::pthread_self() } as usize;
+            if id != old_id {
+                return None;
+            }
+            let mut frames = [Frame::default(); MAX_FRAMES];
+            let result = unwind::unwind(&mut frames).map(<[Frame]>::to_vec);
+            // Exercise the actual SIGPROF callback, not only the lookup helper.
+            for _ in 0..200 {
+                assert_eq!(unsafe { libc::raise(libc::SIGPROF) }, 0);
+            }
+            Some((id, result))
+        })
+        .join()
+        .unwrap();
+        if observation.is_some() {
+            reused = observation;
+            break;
+        }
+    }
+    let (fresh_id, stack) =
+        reused.expect("pthread identity was not reused in 256 joined native threads");
+    assert_eq!(fresh_id, old_id);
+    assert_eq!(
+        stack,
+        Err(unwind::Error::NoThreadState),
+        "abandoned={abandoned:#x}, reused pthread={old_id:#x}, full observed stack={stack:#?}"
+    );
+    assert!(
+        still_linked(),
+        "the fixture must retain the abandoned state during the fresh thread's samples"
+    );
+
+    // One direct unwind and 200 signal deliveries must all report no Python
+    // state. Assert the complete encoded profile and its exact period weight.
+    let mut buffer = crate::signal_backend::ProfileBuffer::new();
+    let range = crate::utils::TimeRange::new(
+        std::time::UNIX_EPOCH,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(3),
+    )
+    .unwrap();
+    let profile = buffer.report(100, &range).unwrap();
+    let actual: Vec<_> = profile
+        .sample
+        .iter()
+        .map(|sample| {
+            let frames: Vec<_> = sample
+                .location_id
+                .iter()
+                .rev()
+                .flat_map(|id| {
+                    let location = profile.location.iter().find(|l| l.id == *id).unwrap();
+                    location.line.iter().map(|line| {
+                        let function = profile
+                            .function
+                            .iter()
+                            .find(|f| f.id == line.function_id)
+                            .unwrap();
+                        (
+                            profile.string_table[function.name as usize].as_str(),
+                            profile.string_table[function.filename as usize].as_str(),
+                            line.line,
+                        )
+                    })
+                })
+                .collect();
+            (frames, sample.value.clone())
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        vec![(
+            vec![("[dropped: no_thread_state]", "", 0)],
+            vec![2_010_000_000]
+        )],
+        "full profile: {profile:#?}"
+    );
+    let mut consumer = unwind::consumer().unwrap();
+    assert_eq!(
+        consumer.pop_slice(&mut [Frame::default(); MAX_FRAMES]),
+        Err(pyroscope_ringbuffer::PopError::Empty),
+        "a fresh non-Python thread must publish no Python stack; full profile: {profile:#?}"
+    );
+    eprintln!(
+        "retained state {abandoned:#x}, reused pthread {old_id:#x}: all 201 periods have no Python state"
+    );
 }

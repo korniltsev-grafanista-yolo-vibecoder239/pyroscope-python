@@ -28,6 +28,31 @@ def zero_rate():
     assert pyroscope.shutdown()
 
 
+def replaced_thread_local():
+    import _thread
+
+    original = _thread._local
+
+    class Subclass(original):
+        pass
+
+    class Discarding:
+        def __setattr__(self, name, value):
+            pass
+
+    try:
+        for replacement in (Subclass, Discarding, dict):
+            _thread._local = replacement
+            for timer in (pyroscope.SignalTimer.ITimer, pyroscope.SignalTimer.CTimer):
+                assert not configure(signal_timer=timer), replacement
+                assert not pyroscope.shutdown()
+    finally:
+        _thread._local = original
+    # Failure must leave startup retryable once the real lifetime primitive returns.
+    assert configure()
+    assert pyroscope.shutdown()
+
+
 def ctimer_shutdown_fork():
     timer = pyroscope.SignalTimer.CTimer
     assert configure(signal_timer=timer)

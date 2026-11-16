@@ -169,6 +169,7 @@ fn resolves_real_cpython_stack_shapes() {
     // SAFETY: these tests preserve recovery handlers throughout all walks.
     unsafe { kindasafe_init::init() }.unwrap();
     Python::attach(|py| {
+        assert!(unsafe { unwind::prepare_thread_lookup() });
         let foreign = module(py, FOREIGN_SOURCE, FOREIGN_FILENAME, "resolver_foreign");
         for (index, filename) in ["frames.py", "frames_é.py", "frames_中.py", "frames_🐍.py"]
             .into_iter()
@@ -342,4 +343,72 @@ fn resolves_real_cpython_stack_shapes() {
             }
         }
     });
+}
+
+#[cfg(Py_3_15)]
+#[test]
+fn published_states_survive_native_work_but_not_state_deletion_or_pthread_reuse() {
+    use crate::signal_backend::{ProfileBuffer, tests::collect_records};
+    use std::time::{Duration, UNIX_EPOCH};
+    unsafe extern "C" {
+        fn pyroscope_signal_test_lifecycles() -> libc::c_int;
+        fn pyroscope_signal_test_lifecycles_cleanup();
+        fn pyroscope_signal_test_evaluator_conflict() -> libc::c_int;
+    }
+    let _guard = crate::signal_sampler::METRICS_LOCK.lock().unwrap();
+    Python::initialize();
+    unsafe { kindasafe_init::init() }.unwrap();
+    unwind::METRICS.take_drop_counts();
+    let mut profile = ProfileBuffer::new();
+    Python::attach(|_py| {
+        let _handler =
+            pyroscope_signal_timer::SignalHandler::install(libc::SIGPROF, super::signal_handler)
+                .unwrap();
+        let result = unsafe { pyroscope_signal_test_lifecycles() };
+        assert_eq!(result, 1, "fixture failed or could not force pthread reuse");
+        // The fixture explicitly retains every sampled module until resolution.
+        collect_records(&mut profile);
+        unsafe { pyroscope_signal_test_lifecycles_cleanup() };
+        assert_eq!(unsafe { pyroscope_signal_test_evaluator_conflict() }, 1);
+    });
+    let range =
+        crate::utils::TimeRange::new(UNIX_EPOCH, UNIX_EPOCH + Duration::from_secs(1)).unwrap();
+    let profile = profile.report(100, &range).unwrap();
+    let mut actual: Vec<_> = profile
+        .sample
+        .iter()
+        .map(|sample| {
+            let names: Vec<_> = sample
+                .location_id
+                .iter()
+                .rev()
+                .map(|id| {
+                    let location = profile
+                        .location
+                        .iter()
+                        .find(|location| location.id == *id)
+                        .unwrap();
+                    assert_eq!(location.line.len(), 1, "{profile:#?}");
+                    let function = profile
+                        .function
+                        .iter()
+                        .find(|function| function.id == location.line[0].function_id)
+                        .unwrap();
+                    profile.string_table[function.name as usize].as_str()
+                })
+                .collect();
+            (names, sample.value.clone())
+        })
+        .collect();
+    actual.sort();
+    let mut wanted = vec![
+        (vec!["<module>", "existing", "entered"], vec![230_000_000]),
+        (vec!["<module>", "reentered"], vec![460_000_000]),
+        (vec!["[dropped: no_thread_state]"], vec![500_000_000]),
+    ];
+    wanted.sort();
+    // 19 cold-native + 11 after deletion + 7 before entry on the reused pthread
+    // + 13 after deletion there. Exact real signal counts: no sampling tolerance.
+    // reentered includes 17 samples interrupting a native SIGUSR1 handler.
+    assert_eq!(actual, wanted, "full profile: {profile:#?}");
 }

@@ -234,6 +234,14 @@ fn initialize_agent(
                 },
             })
         });
+    if signal_config.is_some() && sample_rate != 0 {
+        // The publisher uses Python APIs and must run before ffikit releases the GIL.
+        if !unsafe { pyroscope_python_unwind::prepare_thread_lookup() } {
+            let error = PyErr::fetch(py);
+            log::error!(target: "pyroscope-python", "failed to prepare Signal thread lookup: {error}");
+            return false;
+        }
+    }
     if signal_timer == SignalTimer::CTimer
         && signal_config.is_some()
         && let Err(e) = signal_backend::threads::install(py)
@@ -334,7 +342,7 @@ pub enum ProfilerImplementation {
     PySpy = 0,
     Stack = 1,
     /// Experimental: unwinds the python stack of the thread on the CPU inside a `SIGPROF`
-    /// handler. CPython 3.11 to 3.14 only, no thread ids, names or line numbers.
+    /// handler. CPython 3.10 to 3.15, with line numbers but no thread ids or names.
     Signal = 2,
 }
 

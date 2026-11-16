@@ -294,7 +294,22 @@ pub(crate) mod tests {
     use prost::Message;
     use std::time::{Duration, UNIX_EPOCH};
 
-    #[cfg(all(not(miri), not(Py_3_15)))]
+    #[cfg(all(not(miri), Py_3_15))]
+    pub(crate) fn collect_records(buffer: &mut ProfileBuffer) {
+        use pyroscope_python_resolve::{PYO3Types, Resolver};
+        use pyroscope_python_unwind::{self as unwind, Frame, MAX_FRAMES};
+        let mut consumer = unwind::consumer().unwrap();
+        let mut frames = [Frame::default(); MAX_FRAMES];
+        let mut resolver = Resolver::<PYO3Types>::new(signal_sampler::Lines::NoLine);
+        while let Ok((n, metadata)) = consumer.pop_slice(&mut frames) {
+            let resolved = resolver
+                .resolve_stack(&frames[..n], metadata.count, &mut buffer.strings)
+                .expect("retained fixture code objects must resolve");
+            add_sample(&mut buffer.builder, resolved, metadata.count);
+        }
+    }
+
+    #[cfg(not(miri))]
     pub(crate) fn profile_for_resolved_stack(
         frames: &[FFIFrame],
         strings: StringTable,

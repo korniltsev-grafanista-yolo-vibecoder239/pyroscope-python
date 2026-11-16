@@ -79,7 +79,7 @@ func TestPythonSignalProfilerCTimerOverruns(t *testing.T) {
 	// At 100 Hz the bursts can evade scheduler ticks, coalescing expirations;
 	// each delivery must carry 1 + si_overrun periods through to the profile.
 	// Allow 20% sampling/timer noise and 10% weight outside the full burst stack.
-	// These module-level function names are the same on CPython 3.10–3.14.
+	// These module-level function names are the same on CPython 3.10–3.15.
 	selector := fmt.Sprintf(`{service_name="%s"}`, appName)
 	requireProfileShape(t, workload, pyroscopeURL, cpuProfileTypeID, selector, profileShape{
 		stacks:   []stackShare{{"<module>;cpu_bursts", 0.90, 1}},
@@ -134,7 +134,11 @@ func TestPythonSignalProfilerLifecycle(t *testing.T) {
 	wheelDir := ensureWheel(t)
 	net := dockertest.CreateNetwork(t)
 	startPyroscope(t, net)
-	for _, scenario := range []string{"zero_rate", "ctimer_shutdown_fork", "recovery_handlers_preserved", "bounded_drain", "fault_fallback"} {
+	scenarios := []string{"zero_rate", "ctimer_shutdown_fork", "recovery_handlers_preserved", "bounded_drain", "fault_fallback"}
+	if _, minor := pythonVersion(t); minor >= 15 {
+		scenarios = append(scenarios, "replaced_thread_local")
+	}
+	for _, scenario := range scenarios {
 		t.Run(scenario, func(t *testing.T) {
 			workload := startPythonTestContainer(t, net, wheelDir, "signal_lifecycle_workload.py", map[string]string{
 				"SCENARIO": scenario,
@@ -288,8 +292,8 @@ func skipUnlessPythonSupportsSignal(t *testing.T) {
 	t.Helper()
 	skipUnlessProfiler(t, "signal")
 	major, minor := pythonVersion(t)
-	if major != 3 || minor < 10 || minor > 14 {
-		t.Skip("the Signal profiler supports only CPython 3.10 to 3.14")
+	if major != 3 || minor < 10 || minor > 15 {
+		t.Skip("the Signal profiler supports only CPython 3.10 to 3.15")
 	}
 }
 

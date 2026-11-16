@@ -22,6 +22,10 @@
 #include <internal/pycore_frame.h>
 #endif
 
+#ifdef Py_STACKREF_DEBUG
+#error "Signal requires pointer-valued stack references, not Py_STACKREF_DEBUG indices"
+#endif
+
 static FILE *out;
 
 static void print_usize(const char *name, size_t value) {

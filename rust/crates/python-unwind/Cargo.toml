@@ -16,3 +16,4 @@ kindasafe_init.workspace = true
 
 [build-dependencies]
 pyo3-build-config.workspace = true
+cc = "1"

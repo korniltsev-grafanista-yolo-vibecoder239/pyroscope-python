@@ -57,16 +57,22 @@ jobs:
         working-directory: rust
 
   test:
-    name: cargo test (${{ matrix.arch.name }})
+    name: cargo test (${{ matrix.arch.name }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.arch.runner }}
     strategy:
       fail-fast: false
       matrix:
+        python: ["3.10", "3.14", "3.15"]
         arch:
           - name: x64
             runner: ${{ github.repository_owner == 'grafana' && 'ubuntu-x64-small' || 'ubuntu-latest' }}
           - name: arm64
             runner: ${{ github.repository_owner == 'grafana' && 'ubuntu-arm64-large' || 'ubuntu-24.04-arm' }}
+        include:
+          - python: "3.15"
+            arch:
+              name: macos-arm64
+              runner: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,12 +83,26 @@ jobs:
         with:
           toolchain: 1.99.1
 
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
       - name: Run tests
         run: |
           export Python3_ROOT_DIR=$(python3 -c 'import sys, pathlib; print(pathlib.Path(sys.base_prefix).resolve())')
           export Python3_EXECUTABLE=$(python3 -c 'import sys; print(sys.executable)')
           cargo test --locked --workspace
           cargo test --manifest-path ../kindasafe/Cargo.toml --locked --workspace
+        working-directory: rust
+
+      - name: Check 3.15 stacks with JIT requested
+        if: matrix.python == '3.15'
+        env:
+          PYTHON_JIT: "1"
+        run: |
+          export Python3_ROOT_DIR=$(python3 -c 'import sys; print(sys.base_prefix)')
+          export Python3_EXECUTABLE=$(python3 -c 'import sys; print(sys.executable)')
+          cargo test --locked -p pyroscope_python_extension cpython_tests
         working-directory: rust
 
   miri:

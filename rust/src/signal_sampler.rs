@@ -67,9 +67,9 @@ pub(super) static METRICS_LOCK: Mutex<()> = Mutex::new(());
 
 fn check_version(version: (u8, u8)) -> Result<(), Error> {
     let (major, minor) = version;
-    if !matches!(version, (3, 10..=14)) {
+    if !matches!(version, (3, 10..=15)) {
         return Err(format!(
-            "unwinding in the signal handler supports only Python 3.10 to 3.14, found {major}.{minor}"
+            "unwinding in the signal handler supports only Python 3.10 to 3.15, found {major}.{minor}"
         ));
     }
     if version != unwind::PY_VERSION {
@@ -95,6 +95,8 @@ pub struct SignalHandlerSession {
 }
 
 impl SignalHandlerSession {
+    /// The configuring Python thread must first call `unwind::prepare_thread_lookup`
+    /// while holding the GIL. Session startup itself runs detached from Python.
     pub fn start(config: &Config) -> Result<SignalHandlerSession, Error> {
         check_version(config.python_version)?;
         if config.sampling_rate == 0 {
@@ -187,6 +189,6 @@ pub fn thread_removed(timer: &SharedTimer, tid: timer::pid_t) {
     }
 }
 
-#[cfg(all(test, not(miri), not(Py_3_15)))]
+#[cfg(all(test, not(miri)))]
 #[path = "signal_sampler/tests/cpython.rs"]
 mod cpython_tests;

@@ -7,6 +7,23 @@ def direct():  # first: direct
     return assert_stack(expected)  # call: direct
 
 
+def detached():  # first: detached
+    return assert_stack(expected, 19, True)  # call: detached
+
+
+def catch_throw():  # first: catch_throw
+    try:
+        yield
+    except ValueError:
+        yield assert_stack(expected)  # call: catch_throw
+
+
+def generator_throw():  # first: generator_throw
+    generator = catch_throw()
+    next(generator)
+    return generator.throw(ValueError("injected"))  # call: generator_throw
+
+
 def nested():  # first: nested
     def outer():  # first: outer
         def inner():  # first: inner

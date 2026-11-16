@@ -15,11 +15,23 @@ static STACKS_CHECKED: AtomicUsize = AtomicUsize::new(0);
 // Root-to-leaf name, filename, first line, and current line, supplied by the test.
 type ExpectedFrame = (String, String, i32, i32);
 
-#[pyfunction(signature = (expected, count = 1))]
-fn assert_stack(expected: Vec<ExpectedFrame>, count: usize) -> PyResult<usize> {
+#[pyfunction(signature = (expected, count = 1, detached = false))]
+fn assert_stack(
+    py: Python<'_>,
+    expected: Vec<ExpectedFrame>,
+    count: usize,
+    detached: bool,
+) -> PyResult<usize> {
     let mut buffer = [Frame::default(); MAX_FRAMES];
-    let raw = unwind::unwind(&mut buffer)
-        .map_err(|error| PyAssertionError::new_err(format!("unwind failed: {error:?}")))?;
+    let mut capture = || unwind::unwind(&mut buffer).map(<[Frame]>::len);
+    let result = if detached {
+        py.detach(capture)
+    } else {
+        capture()
+    };
+    let n =
+        result.map_err(|error| PyAssertionError::new_err(format!("unwind failed: {error:?}")))?;
+    let raw = &buffer[..n];
     for mode in [Lines::LastInstruction, Lines::First, Lines::NoLine] {
         let mut strings = StringTable::new();
         let mut resolver = Resolver::<PYO3Types>::new(mode);
@@ -169,6 +181,8 @@ fn resolves_real_cpython_stack_shapes() {
     // SAFETY: these tests preserve recovery handlers throughout all walks.
     unsafe { kindasafe_init::init() }.unwrap();
     Python::attach(|py| {
+        #[cfg(Py_3_15)]
+        let _mirror = super::EvalMirror::install().unwrap();
         let foreign = module(py, FOREIGN_SOURCE, FOREIGN_FILENAME, "resolver_foreign");
         for (index, filename) in ["frames.py", "frames_é.py", "frames_中.py", "frames_🐍.py"]
             .into_iter()
@@ -196,6 +210,14 @@ fn resolves_real_cpython_stack_shapes() {
             }
             let cases = [
                 ("direct", vec![frame("direct", "direct")]),
+                ("detached", vec![frame("detached", "detached")]),
+                (
+                    "generator_throw",
+                    vec![
+                        frame("generator_throw", "generator_throw"),
+                        frame("catch_throw", "catch_throw"),
+                    ],
+                ),
                 (
                     "nested",
                     vec![
@@ -343,3 +365,7 @@ fn resolves_real_cpython_stack_shapes() {
         }
     });
 }
+
+#[cfg(Py_3_15)]
+#[path = "eval_mirror.rs"]
+mod mirror_tests;

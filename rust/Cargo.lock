@@ -1637,6 +1637,7 @@ dependencies = [
 name = "pyroscope-python-unwind"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "kindasafe",
  "kindasafe_init",
  "pyo3-build-config",

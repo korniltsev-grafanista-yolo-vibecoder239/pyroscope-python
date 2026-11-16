@@ -10,8 +10,21 @@
 //! Initialize kindasafe recovery, invoke [`handler`] from a `SIGPROF` callback, and drain with [`consumer`].
 //! Each record contains the interrupted thread's frames, innermost first, and its sampling-period count.
 //!
-//! Supports CPython 3.10 to 3.14, default (GIL) build, 64-bit targets. The offsets come from the
+//! Supports CPython 3.10 to 3.15, default (GIL) build, x86-64/ARM64 Linux/macOS. The offsets come from the
 //! checked-in layouts verified against the target CPython headers by `pyroscope-python-offsets`.
+//! On 3.15, call `eval_mirror::install` on a normal GIL-held thread before sampling.
+//! The main interpreter's PEP 523 callback registers states in SDK-owned pthread
+//! storage; a weak watcher of CPython's thread-lifetime sentinel invalidates each
+//! state before deletion and waits for any current walk. Retaining the thread
+//! dictionary does not retain this binding's validity. SIGPROF only reads storage and
+//! takes a lock-free reader pin. It never accesses CPython compiler TLS or searches
+//! by thread identity. Unregistered threads produce `NoThreadState` drops.
+//! Configuration registers its caller immediately. Other already-running threads
+//! become visible at their next Python frame evaluation, not while still in an
+//! earlier native call or loop. Configure before starting their work. Only the main
+//! interpreter is supported; foreign state migration/switching outside evaluation,
+//! competing PEP 523 evaluators and indexed `Py_STACKREF_DEBUG` builds are unsupported.
+//! The hook inhibits CPython call specialization/JIT and adds per-call overhead.
 //!
 //! Native reads rely on CPython's current-thread ownership of the active frame chain: the
 //! interrupted thread is paused, active frames retain their code, and other threads must not
@@ -55,8 +68,7 @@ const SKIP_OWNERS: u8 = 1 << layout::FRAME_OWNED_BY_CSTACK;
 #[cfg(all(Py_3_14, not(Py_3_15)))]
 const SKIP_OWNERS: u8 =
     (1 << layout::FRAME_OWNED_BY_CSTACK) | (1 << layout::FRAME_OWNED_BY_INTERPRETER);
-// CPython 3.15 removed C-stack-owned frames. Keep the crate buildable for the
-// other profilers; Signal startup still rejects 3.15 before installing a timer.
+// CPython 3.15 removed C-stack-owned frames, retaining interpreter sentinels.
 #[cfg(Py_3_15)]
 const SKIP_OWNERS: u8 = 1 << layout::FRAME_OWNED_BY_INTERPRETER;
 
@@ -104,7 +116,7 @@ pub fn handler(metadata: SampleMetadata) {
     // TODO: consider MaybeUninit for frame storage after measuring the initialization cost.
     let mut frames = [Frame::default(); MAX_FRAMES];
     // Unwind errors are counted by the unwinder. Never publish a partial stack.
-    let Ok(frames) = unwind_thread(current_thread_state(), &mut frames, metadata.count) else {
+    let Ok(frames) = unwind_current(&mut frames, metadata.count) else {
         return;
     };
     record_stack(frames, metadata);
@@ -125,10 +137,24 @@ fn record_stack(frames: &[Frame], metadata: SampleMetadata) {
 }
 
 #[inline(always)]
+#[cfg(not(Py_3_15))]
 fn current_thread_state() -> usize {
-    // TODO: PyGILState_GetThisThreadState is not safe on 3.15; find another way to get the tstate.
-    // SAFETY: this queries the calling thread's state without requiring the GIL.
+    // SAFETY: 3.10–3.14 use pthread TSD without requiring the GIL.
     unsafe { pyo3_ffi::PyGILState_GetThisThreadState() as usize }
+}
+
+#[cfg(Py_3_15)]
+pub mod eval_mirror;
+
+fn unwind_current(frames: &mut [Frame], count: usize) -> Result<&[Frame], Error> {
+    #[cfg(Py_3_15)]
+    let guard = eval_mirror::ReadGuard::acquire();
+    #[cfg(Py_3_15)]
+    let state = guard.state;
+    #[cfg(not(Py_3_15))]
+    let state = current_thread_state();
+    // Keep the 3.15 reader pin until all tstate/frame reads have completed.
+    unwind_thread(state, frames, count)
 }
 
 #[derive(Default)]
@@ -179,8 +205,9 @@ impl Metrics {
 /// Writes the calling thread's frames into `frames`, innermost first, and returns that subslice.
 /// On error, the caller must discard the partial stack.
 /// Unwind errors are counted here; publishing the stack is the caller's responsibility.
+/// On 3.15, `eval_mirror::install` must have succeeded before this call.
 pub fn unwind(frames: &mut [Frame]) -> Result<&[Frame], Error> {
-    unwind_thread(current_thread_state(), frames, 1)
+    unwind_current(frames, 1)
 }
 
 fn unwind_thread(tstate: usize, frames: &mut [Frame], count: usize) -> Result<&[Frame], Error> {
@@ -222,7 +249,7 @@ fn walk(tstate: usize, frames: &mut [Frame]) -> Result<&[Frame], Error> {
         #[cfg(Py_3_12)]
         {
             let owner = read_u8(frame, layout::OWNER)?;
-            if SKIP_OWNERS & (1 << owner) != 0 {
+            if SKIP_OWNERS.checked_shr(owner.into()).unwrap_or(0) & 1 != 0 {
                 frame = previous;
                 continue;
             }

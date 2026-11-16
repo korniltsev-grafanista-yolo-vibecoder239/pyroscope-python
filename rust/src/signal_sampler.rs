@@ -67,9 +67,9 @@ pub(super) static METRICS_LOCK: Mutex<()> = Mutex::new(());
 
 fn check_version(version: (u8, u8)) -> Result<(), Error> {
     let (major, minor) = version;
-    if !matches!(version, (3, 10..=14)) {
+    if !matches!(version, (3, 10..=15)) {
         return Err(format!(
-            "unwinding in the signal handler supports only Python 3.10 to 3.14, found {major}.{minor}"
+            "unwinding in the signal handler supports only Python 3.10 to 3.15, found {major}.{minor}"
         ));
     }
     if version != unwind::PY_VERSION {
@@ -85,11 +85,39 @@ fn check_version(version: (u8, u8)) -> Result<(), Error> {
 /// [`thread_created`] and [`thread_removed`]. `None` once the session ended.
 pub type SharedTimer = Arc<Mutex<Option<Timer>>>;
 
+// The session owns the hook. Removing it needs the GIL, so callers must release
+// the GIL while joining the sampler thread (as ffikit::drop_agent already does).
+#[cfg(Py_3_15)]
+struct EvalMirror;
+
+#[cfg(Py_3_15)]
+impl EvalMirror {
+    fn install() -> Result<Self, Error> {
+        // SAFETY: normal execution with Python alive and the GIL held by attach.
+        // The native installer rejects subinterpreters and competing owners.
+        pyo3::Python::attach(|_| unsafe { unwind::eval_mirror::install() })
+            .map_err(str::to_owned)?;
+        Ok(Self)
+    }
+}
+
+#[cfg(Py_3_15)]
+impl Drop for EvalMirror {
+    fn drop(&mut self) {
+        // SAFETY: the session ends before Python finalization; attach holds the
+        // GIL, and the signal handler has already been removed by field order.
+        pyo3::Python::attach(|_| unsafe { unwind::eval_mirror::uninstall() });
+    }
+}
+
 /// Running signal sampling. Only one can exist at a time.
 pub struct SignalHandlerSession {
     timer: SharedTimer,
     // Dropped after the timer, see the `Drop` impl.
     _handler: SignalHandler,
+    // Removed after the signal handler; tokens survive until state/thread exit.
+    #[cfg(Py_3_15)]
+    _mirror: EvalMirror,
     buf: Vec<Frame>,
     resolver: resolve::Resolver<resolve::PYO3Types>,
 }
@@ -114,6 +142,8 @@ impl SignalHandlerSession {
             while consumer.pop_slice(&mut buf).is_ok() {}
         }
 
+        #[cfg(Py_3_15)]
+        let mirror = EvalMirror::install()?;
         let signal_handler = SignalHandler::install(Timer::SIGNAL, signal_handler)
             .map_err(|e| format!("failed to install the signal handler: {e}"))?;
         // Discard drop counts left by the previous session before arming the timer.
@@ -131,6 +161,8 @@ impl SignalHandlerSession {
         Ok(SignalHandlerSession {
             timer: Arc::new(Mutex::new(Some(timer))),
             _handler: signal_handler,
+            #[cfg(Py_3_15)]
+            _mirror: mirror,
             buf,
             resolver,
         })
@@ -187,6 +219,6 @@ pub fn thread_removed(timer: &SharedTimer, tid: timer::pid_t) {
     }
 }
 
-#[cfg(all(test, not(miri), not(Py_3_15)))]
+#[cfg(all(test, not(miri)))]
 #[path = "signal_sampler/tests/cpython.rs"]
 mod cpython_tests;

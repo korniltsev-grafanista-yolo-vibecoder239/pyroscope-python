@@ -10,8 +10,14 @@
 //! Initialize kindasafe recovery, invoke [`handler`] from a `SIGPROF` callback, and drain with [`consumer`].
 //! Each record contains the interrupted thread's frames, innermost first, and its sampling-period count.
 //!
-//! Supports CPython 3.10 to 3.14, default (GIL) build, 64-bit targets. The offsets come from the
+//! Supports CPython 3.10 to 3.15, default (GIL) build, 64-bit Linux/macOS targets. The offsets come from the
 //! checked-in layouts verified against the target CPython headers by `pyroscope-python-offsets`.
+//! On 3.15, call [`initialize_thread_state_lookup`] on a normal attached Python thread before
+//! sampling. It discovers CPython's bound-state compiler-TLS slot. Walks read that slot directly,
+//! without the allocating TLS resolver or a search by recyclable thread identifiers. A fresh
+//! native thread therefore cannot inherit another thread's state through identifier reuse.
+//! TLS source ranges must not overlap unrelated live Rust exclusive borrows, including after
+//! allocation reuse. Copied bytes remain untrusted; recovery proves neither identity nor coherence.
 //!
 //! Native reads rely on CPython's current-thread ownership of the active frame chain: the
 //! interrupted thread is paused, active frames retain their code, and other threads must not
@@ -55,8 +61,7 @@ const SKIP_OWNERS: u8 = 1 << layout::FRAME_OWNED_BY_CSTACK;
 #[cfg(all(Py_3_14, not(Py_3_15)))]
 const SKIP_OWNERS: u8 =
     (1 << layout::FRAME_OWNED_BY_CSTACK) | (1 << layout::FRAME_OWNED_BY_INTERPRETER);
-// CPython 3.15 removed C-stack-owned frames. Keep the crate buildable for the
-// other profilers; Signal startup still rejects 3.15 before installing a timer.
+// CPython 3.15 removed C-stack-owned entry frames, retaining interpreter sentinels.
 #[cfg(Py_3_15)]
 const SKIP_OWNERS: u8 = 1 << layout::FRAME_OWNED_BY_INTERPRETER;
 
@@ -98,13 +103,14 @@ pub fn consumer() -> Option<Consumer<'static, Frame, SLOTS, SampleMetadata>> {
 
 /// Unwinds the interrupted thread into the ring buffer. Requires successful recovery initialization
 /// and both recovery signals to remain unblocked, as documented by [`unwind`].
+/// On 3.15, [`initialize_thread_state_lookup`] must also have succeeded before sampling.
 /// `metadata.count` is the number of sampling periods represented by this delivery (including overruns).
 /// Errors and buffer drops retain the same count as a successfully published stack.
 pub fn handler(metadata: SampleMetadata) {
     // TODO: consider MaybeUninit for frame storage after measuring the initialization cost.
     let mut frames = [Frame::default(); MAX_FRAMES];
     // Unwind errors are counted by the unwinder. Never publish a partial stack.
-    let Ok(frames) = unwind_thread(current_thread_state(), &mut frames, metadata.count) else {
+    let Ok(frames) = unwind_current_thread(&mut frames, metadata.count) else {
         return;
     };
     record_stack(frames, metadata);
@@ -125,10 +131,32 @@ fn record_stack(frames: &[Frame], metadata: SampleMetadata) {
 }
 
 #[inline(always)]
-fn current_thread_state() -> usize {
-    // TODO: PyGILState_GetThisThreadState is not safe on 3.15; find another way to get the tstate.
-    // SAFETY: this queries the calling thread's state without requiring the GIL.
-    unsafe { pyo3_ffi::PyGILState_GetThisThreadState() as usize }
+#[cfg(not(Py_3_15))]
+fn current_thread_state() -> Result<usize, Error> {
+    // SAFETY: CPython 3.10–3.14 use pthread_getspecific, without requiring the GIL.
+    Ok(unsafe { pyo3_ffi::PyGILState_GetThisThreadState() as usize })
+}
+
+#[cfg(Py_3_15)]
+mod thread_state;
+
+/// Prepare the CPython 3.15 compiler-TLS lookup on a normal thread, before installing SIGPROF.
+/// Earlier versions need no preparation. Initialization failures must prevent sampling.
+///
+/// # Safety
+/// The caller must have an attached Python thread state and hold the GIL. Recovery must already
+/// be initialized under the crate's handler, signal-mask and source-borrow preconditions.
+/// This may allocate and take loader locks; never call it from a signal handler.
+pub unsafe fn initialize_thread_state_lookup() -> Result<(), &'static str> {
+    #[cfg(Py_3_15)]
+    // SAFETY: forwarded from the caller.
+    unsafe { thread_state::initialize() }?;
+    Ok(())
+}
+
+#[cfg(Py_3_15)]
+fn current_thread_state() -> Result<usize, Error> {
+    thread_state::current()
 }
 
 #[derive(Default)]
@@ -173,6 +201,7 @@ impl Metrics {
 /// Recovery initialization must have succeeded and both fault signals must be deliverable on this thread
 /// throughout the walk. These caller preconditions are not checked at runtime; a failed
 /// memory read can crash the process if they are violated.
+/// On 3.15, prepare the TLS lookup first with [`initialize_thread_state_lookup`].
 ///
 /// An executable whose type is not `PyCode_Type` fails the entire stack.
 /// [`MAX_FRAMES`] bounds the walk, skipped frames included.
@@ -180,15 +209,30 @@ impl Metrics {
 /// On error, the caller must discard the partial stack.
 /// Unwind errors are counted here; publishing the stack is the caller's responsibility.
 pub fn unwind(frames: &mut [Frame]) -> Result<&[Frame], Error> {
-    unwind_thread(current_thread_state(), frames, 1)
+    unwind_current_thread(frames, 1)
 }
 
+fn unwind_current_thread(frames: &mut [Frame], count: usize) -> Result<&[Frame], Error> {
+    count_errors(
+        current_thread_state().and_then(|tstate| unwind_thread_inner(tstate, frames)),
+        count,
+    )
+}
+
+#[cfg(test)]
 fn unwind_thread(tstate: usize, frames: &mut [Frame], count: usize) -> Result<&[Frame], Error> {
-    let result = if tstate == 0 {
+    count_errors(unwind_thread_inner(tstate, frames), count)
+}
+
+fn unwind_thread_inner(tstate: usize, frames: &mut [Frame]) -> Result<&[Frame], Error> {
+    if tstate == 0 {
         Err(Error::NoThreadState)
     } else {
         walk(tstate, frames)
-    };
+    }
+}
+
+fn count_errors<T>(result: Result<T, Error>, count: usize) -> Result<T, Error> {
     result.inspect_err(|error| {
         let counter = match error {
             Error::NoThreadState => &METRICS.no_thread_state,
@@ -222,7 +266,7 @@ fn walk(tstate: usize, frames: &mut [Frame]) -> Result<&[Frame], Error> {
         #[cfg(Py_3_12)]
         {
             let owner = read_u8(frame, layout::OWNER)?;
-            if SKIP_OWNERS & (1 << owner) != 0 {
+            if SKIP_OWNERS.checked_shr(u32::from(owner)).unwrap_or(0) & 1 != 0 {
                 frame = previous;
                 continue;
             }
@@ -259,7 +303,7 @@ fn read_u8(base: usize, offset: usize) -> Result<u8, Error> {
 #[inline(always)]
 fn read_u32(base: usize, offset: usize) -> Result<u32, Error> {
     let addr = base.wrapping_add(offset);
-    // SAFETY: current-thread frame fields are read under the ownership and recovery
+    // SAFETY: CPython fields are read under the ownership, source-borrow and recovery
     // preconditions documented at crate level, without forming a source reference.
     unsafe { kindasafe::u32(addr as u64) }.map_err(|_| Error::Read)
 }
@@ -267,8 +311,8 @@ fn read_u32(base: usize, offset: usize) -> Result<u32, Error> {
 #[inline(always)]
 fn read_usize(base: usize, offset: usize) -> Result<usize, Error> {
     let addr = base.wrapping_add(offset);
-    // SAFETY: these are pointer-sized fields of the interrupted thread's retained frame
-    // chain/code objects, under the runtime ownership assumptions documented at crate level.
+    // SAFETY: these are pointer-sized CPython fields, under the frame ownership and
+    // TLS source-borrow assumptions documented at crate level.
     // No Rust reference to source memory is created. Recovery initialization, preserved
     // handlers, and unblocked recovery signals are caller preconditions documented at
     // crate level.
@@ -297,6 +341,63 @@ mod tests {
     fn set(memory: &mut [usize], offset: usize, value: usize) {
         assert_eq!(offset % size_of::<usize>(), 0);
         memory[offset / size_of::<usize>()] = value;
+    }
+
+    #[cfg(Py_3_12)]
+    #[test]
+    fn skips_entry_sentinels_and_untags_executables() {
+        let _guard = METRICS_LOCK.lock().unwrap();
+        init();
+        let mut code = [0usize; 4];
+        set(
+            &mut code,
+            OB_TYPE,
+            (&raw mut pyo3_ffi::PyCode_Type) as usize,
+        );
+        let mut outer = [0usize; 16];
+        let mut sentinel = [0usize; 16];
+        let mut inner = [0usize; 16];
+        let executable = code.as_ptr() as usize | !EXECUTABLE_MASK;
+        set(&mut outer, layout::EXECUTABLE, executable);
+        set(&mut inner, layout::EXECUTABLE, executable);
+        set(&mut inner, layout::PREVIOUS, sentinel.as_ptr() as usize);
+        set(&mut sentinel, layout::PREVIOUS, outer.as_ptr() as usize);
+        // All supported targets are little endian. Leave the sentinel executable
+        // invalid to prove it is skipped before code/type/instruction reads.
+        #[cfg(Py_3_14)]
+        let owner = layout::FRAME_OWNED_BY_INTERPRETER;
+        #[cfg(not(Py_3_14))]
+        let owner = layout::FRAME_OWNED_BY_CSTACK;
+        sentinel[layout::OWNER / 8] = usize::from(owner) << (8 * (layout::OWNER % 8));
+        let frame = inner.as_ptr() as usize;
+        #[cfg(not(Py_3_13))]
+        let cframe = {
+            let mut cframe = [0usize; 4];
+            set(&mut cframe, layout::CFRAME_FRAME, frame);
+            cframe
+        };
+        #[cfg(not(Py_3_13))]
+        let frame = cframe.as_ptr() as usize;
+        let mut tstate = [0usize; 16];
+        set(&mut tstate, layout::THREAD_FRAME, frame);
+        let mut output = [Frame::default(); 4];
+        assert_eq!(
+            unwind_thread(tstate.as_ptr() as usize, &mut output, 1),
+            Ok([Frame {
+                code: code.as_ptr() as usize,
+                instr: 0
+            }; 2]
+                .as_slice())
+        );
+        set(
+            &mut sentinel,
+            layout::OWNER / 8 * 8,
+            255usize << (8 * (layout::OWNER % 8)),
+        );
+        assert_eq!(
+            unwind_thread(tstate.as_ptr() as usize, &mut output, 1),
+            Err(Error::InvalidCodeType)
+        );
     }
 
     #[test]

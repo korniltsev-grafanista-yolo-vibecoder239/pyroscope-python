@@ -15,8 +15,20 @@ static STACKS_CHECKED: AtomicUsize = AtomicUsize::new(0);
 // Root-to-leaf name, filename, first line, and current line, supplied by the test.
 type ExpectedFrame = (String, String, i32, i32);
 
-#[pyfunction(signature = (expected, count = 1))]
-fn assert_stack(expected: Vec<ExpectedFrame>, count: usize) -> PyResult<usize> {
+#[pyfunction(signature = (expected, count = 1, *, detached = false))]
+fn assert_stack(
+    py: Python<'_>,
+    expected: Vec<ExpectedFrame>,
+    count: usize,
+    detached: bool,
+) -> PyResult<usize> {
+    if detached {
+        return py.detach(|| check_stack(expected, count));
+    }
+    check_stack(expected, count)
+}
+
+fn check_stack(expected: Vec<ExpectedFrame>, count: usize) -> PyResult<usize> {
     let mut buffer = [Frame::default(); MAX_FRAMES];
     let raw = unwind::unwind(&mut buffer)
         .map_err(|error| PyAssertionError::new_err(format!("unwind failed: {error:?}")))?;
@@ -169,6 +181,7 @@ fn resolves_real_cpython_stack_shapes() {
     // SAFETY: these tests preserve recovery handlers throughout all walks.
     unsafe { kindasafe_init::init() }.unwrap();
     Python::attach(|py| {
+        unsafe { unwind::initialize_thread_state_lookup() }.unwrap();
         let foreign = module(py, FOREIGN_SOURCE, FOREIGN_FILENAME, "resolver_foreign");
         for (index, filename) in ["frames.py", "frames_é.py", "frames_中.py", "frames_🐍.py"]
             .into_iter()
@@ -196,6 +209,7 @@ fn resolves_real_cpython_stack_shapes() {
             }
             let cases = [
                 ("direct", vec![frame("direct", "direct")]),
+                ("detached", vec![frame("detached", "detached")]),
                 (
                     "nested",
                     vec![
@@ -342,4 +356,157 @@ fn resolves_real_cpython_stack_shapes() {
             }
         }
     });
+}
+
+#[test]
+fn signals_on_fresh_native_threads_are_counted_without_python_tls() {
+    let _guard = crate::signal_sampler::METRICS_LOCK.lock().unwrap();
+    Python::initialize();
+    // SAFETY: preserve the handlers and keep recovery signals unblocked throughout the test.
+    unsafe { kindasafe_init::init() }.unwrap();
+    Python::attach(|_| unsafe { unwind::initialize_thread_state_lookup() }.unwrap());
+    let _handler =
+        super::timer::SignalHandler::install(super::timer::Timer::SIGNAL, super::signal_handler)
+            .unwrap();
+    unwind::METRICS.take_drop_counts();
+    for _ in 0..32 {
+        std::thread::spawn(|| {
+            // These threads never attach to Python. In 3.15 calling the GIL-state
+            // API here could allocate compiler TLS from inside the signal handler.
+            assert_eq!(unsafe { libc::raise(libc::SIGPROF) }, 0);
+        })
+        .join()
+        .unwrap();
+    }
+    let counts = unwind::METRICS.take_drop_counts();
+    assert_eq!(
+        counts,
+        counts.map(|(reason, _)| (reason, if reason == "no_thread_state" { 32 } else { 0 }))
+    );
+}
+
+#[cfg(Py_3_15)]
+#[test]
+fn native_thread_identity_reuse_does_not_resurrect_a_bound_state() {
+    // Isolate the deliberately retained state: its owning OS thread exits before
+    // anyone deletes it. OS-thread exit destroys its compiler TLS without clearing
+    // the bound_gilstate flag in the retained PyThreadState. Do not finalize that
+    // runtime or delete another thread's bound state from this thread (which
+    // would clear this thread's GIL-state TLS).
+    const CHILD: &str = "PYROSCOPE_TEST_REUSED_THREAD_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "signal_sampler::cpython_tests::native_thread_identity_reuse_does_not_resurrect_a_bound_state", "--nocapture"])
+            .env(CHILD, "1")
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    Python::initialize();
+    unsafe { kindasafe_init::init() }.unwrap();
+    let interpreter = Python::attach(|_| unsafe { pyo3::ffi::PyInterpreterState_Get() as usize });
+    Python::attach(|_| unsafe { unwind::initialize_thread_state_lookup() }.unwrap());
+    let (old_ident, retained) = std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(move || unsafe {
+            let state = pyo3::ffi::PyThreadState_New(interpreter as *mut _);
+            assert!(!state.is_null());
+            pyo3::ffi::PyEval_RestoreThread(state);
+            assert_eq!(pyo3::ffi::PyGILState_GetThisThreadState(), state);
+            assert_eq!(
+                pyo3::ffi::PyRun_SimpleString(c"value = sum(range(10))".as_ptr()),
+                0
+            );
+            let ident = libc::pthread_self() as usize;
+            assert_eq!(pyo3::ffi::PyEval_SaveThread(), state);
+            (ident, state as usize)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    Python::attach(|_| unsafe {
+        let mut state = pyo3::ffi::PyInterpreterState_ThreadHead(interpreter as *mut _);
+        while !state.is_null() && state as usize != retained {
+            state = pyo3::ffi::PyThreadState_Next(state);
+        }
+        assert_eq!(
+            state as usize, retained,
+            "fixture must leave the old bound state linked"
+        );
+    });
+    extern "C" fn sample(_: libc::c_int, _: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        unwind::handler(unwind::SampleMetadata { count: 17 });
+    }
+    let _handler = super::timer::SignalHandler::install(libc::SIGPROF, sample).unwrap();
+    unwind::METRICS.take_drop_counts();
+    let mut consumer = unwind::consumer().unwrap();
+    let mut reused = false;
+    let mut attempts = 0;
+    for _ in 0..128 {
+        let (ident, result, after_delete) = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(move || {
+                let ident = unsafe { libc::pthread_self() } as usize;
+                let mut frames = [Frame::default(); MAX_FRAMES];
+                let result = unwind::unwind(&mut frames).map(|frames| frames.to_vec());
+                assert_eq!(unsafe { libc::raise(libc::SIGPROF) }, 0);
+                // Now enter Python and delete *this* thread's own state before
+                // returning to native work. The older bound state stays linked.
+                unsafe {
+                    let state = pyo3::ffi::PyThreadState_New(interpreter as *mut _);
+                    assert!(!state.is_null());
+                    pyo3::ffi::PyEval_RestoreThread(state);
+                    assert_eq!(pyo3::ffi::PyRun_SimpleString(c"value += 1".as_ptr()), 0);
+                    pyo3::ffi::PyThreadState_Clear(state);
+                    pyo3::ffi::PyThreadState_DeleteCurrent();
+                }
+                let after_delete = unwind::unwind(&mut frames).map(|frames| frames.to_vec());
+                assert_eq!(unsafe { libc::raise(libc::SIGPROF) }, 0);
+                (ident, result, after_delete)
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        attempts += 1;
+        assert_eq!(
+            result,
+            Err(unwind::Error::NoThreadState),
+            "native pthread {ident:#x}, old pthread {old_ident:#x}, retained state {retained:#x}; full stack: {result:#?}"
+        );
+        assert_eq!(
+            after_delete,
+            Err(unwind::Error::NoThreadState),
+            "deleted state resurrected the retained state {retained:#x}; full stack: {after_delete:#?}"
+        );
+        if ident == old_ident {
+            reused = true;
+            break;
+        }
+    }
+    assert!(reused, "did not exercise actual pthread identity reuse");
+    let counts = unwind::METRICS.take_drop_counts();
+    assert_eq!(
+        counts,
+        counts.map(|(reason, _)| (
+            reason,
+            if reason == "no_thread_state" {
+                attempts * 36
+            } else {
+                0
+            }
+        )),
+        "each native probe and its weighted SIGPROF must be rejected exactly once"
+    );
+    let mut frames = [Frame::default(); MAX_FRAMES];
+    let record = consumer.pop_slice(&mut frames);
+    assert_eq!(
+        record,
+        Err(super::ringbuffer::PopError::Empty),
+        "unexpected full profile record: {record:?}, frames: {frames:#?}"
+    );
 }

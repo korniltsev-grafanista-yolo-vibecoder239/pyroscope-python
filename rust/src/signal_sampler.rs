@@ -67,9 +67,9 @@ pub(super) static METRICS_LOCK: Mutex<()> = Mutex::new(());
 
 fn check_version(version: (u8, u8)) -> Result<(), Error> {
     let (major, minor) = version;
-    if !matches!(version, (3, 10..=14)) {
+    if !matches!(version, (3, 10..=15)) {
         return Err(format!(
-            "unwinding in the signal handler supports only Python 3.10 to 3.14, found {major}.{minor}"
+            "unwinding in the signal handler supports only Python 3.10 to 3.15, found {major}.{minor}"
         ));
     }
     if version != unwind::PY_VERSION {
@@ -106,6 +106,7 @@ impl SignalHandlerSession {
         // callbacks compatible and loaded, as documented in README.md and the unwinder.
         unsafe { kindasafe_init::init() }
             .map_err(|error| format!("failed to install memory fault handlers: {error:?}"))?;
+        unwind::prepare_thread_lookup();
         let resolver = resolve::Resolver::new(config.lines);
 
         // Discard what a previous session left behind.
@@ -187,6 +188,6 @@ pub fn thread_removed(timer: &SharedTimer, tid: timer::pid_t) {
     }
 }
 
-#[cfg(all(test, not(miri), not(Py_3_15)))]
+#[cfg(all(test, not(miri)))]
 #[path = "signal_sampler/tests/cpython.rs"]
 mod cpython_tests;

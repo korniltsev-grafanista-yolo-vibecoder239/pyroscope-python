@@ -7,16 +7,29 @@
 //! using kindasafe under its recovery and source-borrow preconditions. An address alone does
 //! not establish lifetime or object identity; deferred reads can observe reused or changing memory.
 //!
-//! Initialize kindasafe recovery, invoke [`handler`] from a `SIGPROF` callback, and drain with [`consumer`].
+//! Initialize kindasafe recovery and call [`prepare_thread_lookup`] on a normal thread before
+//! invoking [`handler`] from a `SIGPROF` callback, then drain with [`consumer`].
 //! Each record contains the interrupted thread's frames, innermost first, and its sampling-period count.
 //!
-//! Supports CPython 3.10 to 3.14, default (GIL) build, 64-bit targets. The offsets come from the
-//! checked-in layouts verified against the target CPython headers by `pyroscope-python-offsets`.
+//! Supports CPython 3.10 to 3.15, default (GIL) builds on x86-64/ARM64 Linux and macOS,
+//! main interpreter only. Indexed `Py_STACKREF_DEBUG` builds are unsupported.
+//! On 3.15, locates the interrupted thread in the main interpreter's thread list instead of
+//! calling the compiler-TLS-based `PyGILState_GetThisThreadState`. That TLS lookup can allocate
+//! or enter the dynamic loader. The bounded list search also finds detached thread states
+//! during C extension work without the GIL. Concurrent thread creation/deletion can make the
+//! search fail; no thread-state pointers are cached between samples.
+//! OS identity queries happen once per walk, not once per memory read. A Linux raw-fork child
+//! keeps its caller's pthread ID but inherits the parent's native ID; the process leader is
+//! allowed that stale native ID. The offsets are verified against the target CPython headers
+//! by `pyroscope-python-offsets`.
 //!
 //! Native reads rely on CPython's current-thread ownership of the active frame chain: the
 //! interrupted thread is paused, active frames retain their code, and other threads must not
 //! mutate that chain. Free-threaded builds and foreign mutation of interpreter internals are
 //! unsupported. This is a runtime assumption, not a proof for every CPython interruption point.
+//! Thread-list reads on 3.15 share the resolver's source-borrow precondition: read ranges must
+//! not overlap unrelated live Rust exclusive borrows, including after allocation reuse.
+//! Recovery does not establish object identity or a coherent snapshot of that list.
 //! SDK users must ensure no other code changes SIGSEGV/SIGBUS handlers during
 //! initialization or after kindasafe has installed its recovery handlers, including across
 //! profiler stops/restarts. Install other handlers before initialization; chained callbacks
@@ -55,8 +68,7 @@ const SKIP_OWNERS: u8 = 1 << layout::FRAME_OWNED_BY_CSTACK;
 #[cfg(all(Py_3_14, not(Py_3_15)))]
 const SKIP_OWNERS: u8 =
     (1 << layout::FRAME_OWNED_BY_CSTACK) | (1 << layout::FRAME_OWNED_BY_INTERPRETER);
-// CPython 3.15 removed C-stack-owned frames. Keep the crate buildable for the
-// other profilers; Signal startup still rejects 3.15 before installing a timer.
+// CPython 3.15 removed C-stack-owned shim frames; its base sentinel remains.
 #[cfg(Py_3_15)]
 const SKIP_OWNERS: u8 = 1 << layout::FRAME_OWNED_BY_INTERPRETER;
 
@@ -68,7 +80,7 @@ pub enum Error {
     Read,
     /// A Python frame's executable was null or was not a code object.
     InvalidCodeType,
-    /// The output slice has no room, or the chain exceeds [`MAX_FRAMES`] (including loops).
+    /// The output slice has no room, or a frame/thread-list walk exceeds its bound (including loops).
     Truncated,
 }
 
@@ -104,7 +116,7 @@ pub fn handler(metadata: SampleMetadata) {
     // TODO: consider MaybeUninit for frame storage after measuring the initialization cost.
     let mut frames = [Frame::default(); MAX_FRAMES];
     // Unwind errors are counted by the unwinder. Never publish a partial stack.
-    let Ok(frames) = unwind_thread(current_thread_state(), &mut frames, metadata.count) else {
+    let Ok(frames) = unwind_current(&mut frames, metadata.count) else {
         return;
     };
     record_stack(frames, metadata);
@@ -125,10 +137,84 @@ fn record_stack(frames: &[Frame], metadata: SampleMetadata) {
 }
 
 #[inline(always)]
-fn current_thread_state() -> usize {
-    // TODO: PyGILState_GetThisThreadState is not safe on 3.15; find another way to get the tstate.
+#[cfg(not(Py_3_15))]
+fn current_thread_state() -> Result<usize, Error> {
     // SAFETY: this queries the calling thread's state without requiring the GIL.
-    unsafe { pyo3_ffi::PyGILState_GetThisThreadState() as usize }
+    Ok(unsafe { pyo3_ffi::PyGILState_GetThisThreadState() as usize })
+}
+
+/// Bound signal-handler work even when a concurrently changing list forms a cycle.
+#[cfg(Py_3_15)]
+const MAX_THREAD_STATES: usize = 4096;
+
+// Public CPython API on Linux and macOS, not exposed by pyo3-ffi.
+#[cfg(Py_3_15)]
+unsafe extern "C" {
+    fn PyThread_get_thread_native_id() -> core::ffi::c_ulong;
+    #[cfg(target_os = "linux")]
+    fn getpid() -> core::ffi::c_int;
+}
+
+/// Resolves the 3.15 lookup's native call bindings before entering any signal handler.
+/// Call on a normal thread after CPython initialization. This does not initialize or
+/// inspect memory-fault recovery, and does not allocate a Python thread state.
+pub fn prepare_thread_lookup() {
+    #[cfg(Py_3_15)]
+    // SAFETY: CPython is initialized. These getters have no GIL requirement.
+    // Their first call may enter the dynamic loader (notably lazy Mach-O bindings),
+    // which must happen here, outside the signal handler. getpid is also bound
+    // now, even though the lookup needs it only for an inherited stale native ID.
+    unsafe {
+        pyo3_ffi::PyInterpreterState_ThreadHead(pyo3_ffi::PyInterpreterState_Main());
+        pyo3_ffi::PyThread_get_thread_ident();
+        PyThread_get_thread_native_id();
+        #[cfg(target_os = "linux")]
+        getpid();
+    }
+}
+
+#[cfg(Py_3_15)]
+fn current_thread_state() -> Result<usize, Error> {
+    // SAFETY: in CPython 3.15 these read the runtime's main-interpreter pointer
+    // and list head, and query OS thread identities. None accesses compiler
+    // TLS, allocates, takes a lock, or requires the GIL. Python is initialized.
+    // The native ID query makes one gettid syscall on Linux; subsequent
+    // memory reads remain direct loads, without per-read syscalls.
+    let head =
+        unsafe { pyo3_ffi::PyInterpreterState_ThreadHead(pyo3_ffi::PyInterpreterState_Main()) }
+            as usize;
+    let thread_id = unsafe { pyo3_ffi::PyThread_get_thread_ident() } as usize;
+    let native_id = unsafe { PyThread_get_thread_native_id() } as usize;
+    find_thread_state(head, thread_id, native_id)
+}
+
+#[cfg(Py_3_15)]
+fn find_thread_state(mut state: usize, thread_id: usize, native_id: usize) -> Result<usize, Error> {
+    for _ in 0..MAX_THREAD_STATES {
+        if state == 0 {
+            return Err(Error::NoThreadState);
+        }
+        // CPython leaves thread_id set after unbinding. Only the state bound
+        // to the thread's GILState TLS slot is eligible, even without the GIL.
+        // pthread_t can be recycled while an embedding runtime retains an
+        // old state. Its native OS ID must match too, except for the process
+        // leader on Linux: a raw fork preserves pthread_self but does not update
+        // the inherited PyThreadState.native_thread_id. The leader's pthread ID
+        // cannot have been recycled from another thread in this process.
+        if read_usize(state, layout::THREAD_ID)? == thread_id
+            && read_u32(state, layout::THREAD_STATUS)? as usize & layout::THREAD_BOUND_GILSTATE != 0
+        {
+            let matches_native_id = read_usize(state, layout::THREAD_NATIVE_ID)? == native_id;
+            #[cfg(target_os = "linux")]
+            // SAFETY: getpid is async-signal-safe and does not access TLS.
+            let matches_native_id = matches_native_id || native_id == unsafe { getpid() } as usize;
+            if matches_native_id {
+                return Ok(state);
+            }
+        }
+        state = read_usize(state, layout::THREAD_NEXT)?;
+    }
+    Err(Error::Truncated)
 }
 
 #[derive(Default)]
@@ -180,15 +266,28 @@ impl Metrics {
 /// On error, the caller must discard the partial stack.
 /// Unwind errors are counted here; publishing the stack is the caller's responsibility.
 pub fn unwind(frames: &mut [Frame]) -> Result<&[Frame], Error> {
-    unwind_thread(current_thread_state(), frames, 1)
+    unwind_current(frames, 1)
 }
 
+fn unwind_current(frames: &mut [Frame], count: usize) -> Result<&[Frame], Error> {
+    let result = current_thread_state().and_then(|state| walk_or_missing(state, frames));
+    count_errors(result, count)
+}
+
+#[cfg(test)]
 fn unwind_thread(tstate: usize, frames: &mut [Frame], count: usize) -> Result<&[Frame], Error> {
-    let result = if tstate == 0 {
+    count_errors(walk_or_missing(tstate, frames), count)
+}
+
+fn walk_or_missing(tstate: usize, frames: &mut [Frame]) -> Result<&[Frame], Error> {
+    if tstate == 0 {
         Err(Error::NoThreadState)
     } else {
         walk(tstate, frames)
-    };
+    }
+}
+
+fn count_errors(result: Result<&[Frame], Error>, count: usize) -> Result<&[Frame], Error> {
     result.inspect_err(|error| {
         let counter = match error {
             Error::NoThreadState => &METRICS.no_thread_state,
@@ -222,7 +321,7 @@ fn walk(tstate: usize, frames: &mut [Frame]) -> Result<&[Frame], Error> {
         #[cfg(Py_3_12)]
         {
             let owner = read_u8(frame, layout::OWNER)?;
-            if SKIP_OWNERS & (1 << owner) != 0 {
+            if SKIP_OWNERS & 1u8.checked_shl(owner.into()).unwrap_or(0) != 0 {
                 frame = previous;
                 continue;
             }
@@ -255,7 +354,7 @@ fn read_u8(base: usize, offset: usize) -> Result<u8, Error> {
     unsafe { kindasafe::u8(addr as u64) }.map_err(|_| Error::Read)
 }
 
-#[cfg(not(Py_3_11))]
+#[cfg(any(not(Py_3_11), Py_3_15))]
 #[inline(always)]
 fn read_u32(base: usize, offset: usize) -> Result<u32, Error> {
     let addr = base.wrapping_add(offset);
@@ -297,6 +396,52 @@ mod tests {
     fn set(memory: &mut [usize], offset: usize, value: usize) {
         assert_eq!(offset % size_of::<usize>(), 0);
         memory[offset / size_of::<usize>()] = value;
+    }
+
+    #[cfg(Py_3_15)]
+    #[test]
+    fn thread_lookup_is_bounded_and_requires_a_bound_matching_thread() {
+        init();
+        let mut first = vec![0usize; layout::THREAD_NATIVE_ID / size_of::<usize>() + 1];
+        let mut second = first.clone();
+        let first_addr = first.as_ptr() as usize;
+        let second_addr = second.as_ptr() as usize;
+        set(&mut first, layout::THREAD_ID, 17);
+        set(&mut second, layout::THREAD_ID, 17);
+        set(&mut first, layout::THREAD_NATIVE_ID, 37);
+        set(&mut second, layout::THREAD_NATIVE_ID, 37);
+        set(
+            &mut second,
+            layout::THREAD_STATUS,
+            layout::THREAD_BOUND_GILSTATE,
+        );
+        set(&mut first, layout::THREAD_NEXT, second_addr);
+        assert_eq!(find_thread_state(first_addr, 17, 37), Ok(second_addr));
+        assert_eq!(
+            find_thread_state(first_addr, 17, usize::MAX),
+            Err(Error::NoThreadState)
+        );
+        assert_eq!(
+            find_thread_state(first_addr, 19, 37),
+            Err(Error::NoThreadState)
+        );
+        assert_eq!(find_thread_state(0, 17, 37), Err(Error::NoThreadState));
+        assert_eq!(find_thread_state(usize::MAX, 17, 37), Err(Error::Read));
+        #[cfg(target_os = "linux")]
+        {
+            // A raw-fork survivor is the process leader with its old native ID.
+            // SAFETY: getpid has no preconditions.
+            let process_id = unsafe { getpid() } as usize;
+            set(&mut second, layout::THREAD_NATIVE_ID, process_id + 1);
+            assert_eq!(
+                find_thread_state(first_addr, 17, process_id),
+                Ok(second_addr)
+            );
+        }
+        set(&mut second, layout::THREAD_NEXT, first_addr);
+        assert_eq!(find_thread_state(first_addr, 19, 37), Err(Error::Truncated));
+        set(&mut second, layout::THREAD_NEXT, usize::MAX);
+        assert_eq!(find_thread_state(first_addr, 19, 37), Err(Error::Read));
     }
 
     #[test]

@@ -130,8 +130,8 @@ fn main() -> PyResult<()> {
     Python::attach(|py| {
         let version = py.version_info();
         assert!(
-            version.major == 3 && (10..=14).contains(&version.minor),
-            "signal stack benchmarks require CPython 3.10–3.14"
+            version.major == 3 && (10..=15).contains(&version.minor),
+            "signal stack benchmarks require CPython 3.10–3.15"
         );
         assert_eq!((version.major, version.minor), unwind::PY_VERSION);
         eprintln!("Benchmarking CPython {}", Python::version_str());
@@ -140,6 +140,7 @@ fn main() -> PyResult<()> {
         // installs no competing recovery handlers. Python remains attached on this
         // thread and retains the source objects throughout each loop.
         unsafe { kindasafe_init::init() }.expect("failed to initialize fault recovery");
+        unwind::prepare_thread_lookup();
 
         let source = CString::new(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),

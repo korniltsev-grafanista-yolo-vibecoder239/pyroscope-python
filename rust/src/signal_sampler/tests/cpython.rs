@@ -3,6 +3,7 @@ use pyroscope_pprof::{StringTable, ffi::FFIFrame};
 use pyroscope_python_resolve::{Lines, PYO3Types, Resolver};
 use pyroscope_python_unwind::{self as unwind, Frame, MAX_FRAMES};
 use std::{
+    collections::BTreeMap,
     ffi::CString,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -67,6 +68,12 @@ fn assert_stack(expected: Vec<ExpectedFrame>, count: usize) -> PyResult<usize> {
     }
     STACKS_CHECKED.fetch_add(1, Ordering::Relaxed);
     Ok(1)
+}
+
+#[pyfunction]
+fn assert_detached_stack(py: Python<'_>, expected: Vec<ExpectedFrame>) -> PyResult<usize> {
+    // A getter for only the attached state would lose this entire stack.
+    py.detach(|| assert_stack(expected, 19))
 }
 
 fn assert_profile_weight(
@@ -160,6 +167,175 @@ fn module<'py>(py: Python<'py>, source: &str, filename: &str, name: &str) -> Bou
         .add_function(wrap_pyfunction!(assert_stack, &module).unwrap())
         .unwrap();
     module
+        .add_function(wrap_pyfunction!(assert_detached_stack, &module).unwrap())
+        .unwrap();
+    module
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn signals_on_native_threads_have_no_python_stack() {
+    let _guard = crate::signal_sampler::METRICS_LOCK.lock().unwrap();
+    Python::initialize();
+    // CTimer starts unarmed until a thread is registered. Deliver explicit
+    // signals to an OS thread which has never called into Python instead.
+    let mut session =
+        crate::signal_sampler::SignalHandlerSession::start(&crate::signal_sampler::Config {
+            python_version: unwind::PY_VERSION,
+            sampling_rate: 100,
+            signal_timer: crate::signal_sampler::SignalTimer::CTimer,
+            lines: Lines::LastInstruction,
+        })
+        .unwrap();
+    std::thread::spawn(|| {
+        for _ in 0..7 {
+            // SAFETY: SIGPROF is installed and raise targets this calling thread.
+            assert_eq!(unsafe { libc::raise(libc::SIGPROF) }, 0);
+        }
+    })
+    .join()
+    .unwrap();
+    let mut strings = StringTable::new();
+    let mut profile = Vec::new();
+    session.drain(&mut strings, |frames, count| {
+        profile.push((
+            frames
+                .iter()
+                .rev()
+                .map(|frame| (frame.function_name.index, frame.file_name.index, frame.line))
+                .collect::<Vec<_>>(),
+            count,
+        ))
+    });
+    let mut table = Vec::new();
+    strings.clone_pprof_table(&mut table);
+    let profile: Vec<_> = profile
+        .iter()
+        .map(|(frames, count)| {
+            (
+                frames
+                    .iter()
+                    .map(|&(name, file, line)| (&table[name as usize], &table[file as usize], line))
+                    .collect::<Vec<_>>(),
+                count,
+            )
+        })
+        .collect();
+    assert!(
+        profile.is_empty(),
+        "full observed root-to-leaf profile: {profile:#?}"
+    );
+    assert_eq!(
+        unwind::METRICS.take_drop_counts(),
+        [
+            ("contentions", 0),
+            ("buffer_dropped", 0),
+            ("no_thread_state", 7),
+            ("invalid_code_type", 0),
+            ("read_errors", 0),
+            ("truncated", 0),
+            ("resolve_error", 0),
+        ],
+        "full observed profile: {profile:#?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_signals_profile_python_and_detached_native_work() {
+    use crate::signal_sampler::{Config, SignalHandlerSession, SignalTimer, thread_created};
+
+    const LIVE_SOURCE: &str = include_str!("../../../../scripts/tests/signal_stacks.py");
+    let _guard = crate::signal_sampler::METRICS_LOCK.lock().unwrap();
+    Python::initialize();
+    Python::attach(|py| {
+        let module = module(py, LIVE_SOURCE, "signal_live.py", "signal_live");
+        let mut session = SignalHandlerSession::start(&Config {
+            python_version: unwind::PY_VERSION,
+            sampling_rate: 100,
+            signal_timer: SignalTimer::CTimer,
+            lines: Lines::First,
+        })
+        .unwrap();
+        let timer = session.timer();
+        thread_created(&timer, pyroscope_signal_timer::gettid()).unwrap();
+        module.getattr("entry").unwrap().call0().unwrap();
+        // Stop producing before draining the finite profile.
+        timer.lock().unwrap().take();
+        let mut strings = StringTable::new();
+        let mut samples = Vec::new();
+        loop {
+            let before = samples.len();
+            session.drain(&mut strings, |frames, count| {
+                samples.push((
+                    frames
+                        .iter()
+                        .rev()
+                        .map(|frame| (frame.function_name.index, frame.file_name.index, frame.line))
+                        .collect::<Vec<_>>(),
+                    count,
+                ));
+            });
+            if samples.len() == before {
+                break;
+            }
+        }
+        let mut table = Vec::new();
+        strings.clone_pprof_table(&mut table);
+        let mut profile = BTreeMap::new();
+        for (frames, count) in samples {
+            let stack: Vec<_> = frames
+                .into_iter()
+                .map(|(name, file, line)| {
+                    (
+                        table[name as usize].as_str(),
+                        table[file as usize].as_str(),
+                        line,
+                    )
+                })
+                .collect();
+            *profile.entry(stack).or_insert(0usize) += count;
+        }
+        let drops = unwind::METRICS.take_drop_counts();
+        let total =
+            profile.values().sum::<usize>() + drops.iter().map(|(_, count)| count).sum::<usize>();
+        let diagnostics =
+            format!("full root-to-leaf profile (100Hz periods): {profile:#?}\ndrops: {drops:?}");
+        // Four thread CPU seconds should produce about 400 periods. Include
+        // lost periods in the denominator so lookup/resolution failures cannot
+        // hide a broken native phase. Allow 20% timer noise, 40–60% per leaf,
+        // and at most 5% unexpected or dropped weight.
+        assert!(total >= 320, "total={total}; {diagnostics}");
+        let frame = |name| {
+            let marker = format!("# first: {name}");
+            let line = LIVE_SOURCE
+                .lines()
+                .position(|line| line.ends_with(&marker))
+                .unwrap() as i32
+                + 1;
+            (name, "signal_live.py", line)
+        };
+        let mut matched = 0;
+        for leaf in ["python_leaf", "native_leaf"] {
+            let mut expected = vec![frame("entry"), frame(leaf)];
+            if leaf == "python_leaf" {
+                // These hot calls may be inlined by the 3.15 JIT. Their full
+                // Python frame chain must still be visible to SIGPROF.
+                expected.extend([frame("python_outer"), frame("python_inner")]);
+            }
+            let value = profile.get(&expected).copied().unwrap_or(0);
+            let share = value as f64 / total as f64;
+            assert!(
+                (0.40..=0.60).contains(&share),
+                "expected {expected:?}: {value}/{total}; {diagnostics}"
+            );
+            matched += value;
+        }
+        assert!(
+            matched as f64 / total as f64 >= 0.95,
+            "matched={matched}/{total}; {diagnostics}"
+        );
+    });
 }
 
 #[test]
@@ -168,6 +344,7 @@ fn resolves_real_cpython_stack_shapes() {
     Python::initialize();
     // SAFETY: these tests preserve recovery handlers throughout all walks.
     unsafe { kindasafe_init::init() }.unwrap();
+    unwind::prepare_thread_lookup();
     Python::attach(|py| {
         let foreign = module(py, FOREIGN_SOURCE, FOREIGN_FILENAME, "resolver_foreign");
         for (index, filename) in ["frames.py", "frames_é.py", "frames_中.py", "frames_🐍.py"]
@@ -196,6 +373,7 @@ fn resolves_real_cpython_stack_shapes() {
             }
             let cases = [
                 ("direct", vec![frame("direct", "direct")]),
+                ("detached", vec![frame("detached", "detached")]),
                 (
                     "nested",
                     vec![

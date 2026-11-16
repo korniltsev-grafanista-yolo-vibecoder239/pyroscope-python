@@ -7,6 +7,10 @@ def direct():  # first: direct
     return assert_stack(expected)  # call: direct
 
 
+def detached():  # first: detached
+    return assert_detached_stack(expected)  # call: detached
+
+
 def nested():  # first: nested
     def outer():  # first: outer
         def inner():  # first: inner

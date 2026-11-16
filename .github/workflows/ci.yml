@@ -51,6 +51,53 @@ jobs:
           version: "0.17.3"
           args: "check --select I --diff"
 
+  rust-native-test:
+    name: Rust native tests - ${{ matrix.os }} - ${{ matrix.python }} - JIT ${{ matrix.jit }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+        jit: ["0"]
+        include:
+          - os: macos-15
+            python: "3.15"
+            jit: "0"
+          - os: ubuntu-latest
+            python: "3.15"
+            jit: "1"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: 1.99.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Test layouts, unwinding, resolution, and real signal sampling
+        env:
+          PYTHON_JIT: ${{ matrix.jit }}
+        run: |
+          target_python="$(python -c 'import sys; print(sys.executable)')"
+          if [ "$PYTHON_JIT" = 1 ]; then
+            python -m pip install uv==0.13.7
+            uv python install 3.15
+            target_python="$(uv python find --managed-python 3.15)"
+            "$target_python" -c 'import sys; assert sys._jit.is_enabled()'
+          fi
+          export PYO3_PYTHON="$target_python"
+          export Python3_EXECUTABLE="$target_python"
+          export Python3_ROOT_DIR="$("$target_python" -c 'import sys; print(sys.base_prefix)')"
+          python_lib="$("$target_python" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')"
+          export PYTHONHOME="$Python3_ROOT_DIR"
+          export LD_LIBRARY_PATH="$python_lib:${LD_LIBRARY_PATH:-}"
+          export DYLD_LIBRARY_PATH="$python_lib:${DYLD_LIBRARY_PATH:-}"
+          cargo test --manifest-path rust/Cargo.toml --locked --workspace
+
   python-linux-build:
     strategy:
       fail-fast: false

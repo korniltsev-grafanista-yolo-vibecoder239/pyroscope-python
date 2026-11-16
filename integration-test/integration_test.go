@@ -79,7 +79,7 @@ func TestPythonSignalProfilerCTimerOverruns(t *testing.T) {
 	// At 100 Hz the bursts can evade scheduler ticks, coalescing expirations;
 	// each delivery must carry 1 + si_overrun periods through to the profile.
 	// Allow 20% sampling/timer noise and 10% weight outside the full burst stack.
-	// These module-level function names are the same on CPython 3.10–3.14.
+	// These module-level function names are the same on CPython 3.10–3.15.
 	selector := fmt.Sprintf(`{service_name="%s"}`, appName)
 	requireProfileShape(t, workload, pyroscopeURL, cpuProfileTypeID, selector, profileShape{
 		stacks:   []stackShare{{"<module>;cpu_bursts", 0.90, 1}},
@@ -288,8 +288,8 @@ func skipUnlessPythonSupportsSignal(t *testing.T) {
 	t.Helper()
 	skipUnlessProfiler(t, "signal")
 	major, minor := pythonVersion(t)
-	if major != 3 || minor < 10 || minor > 14 {
-		t.Skip("the Signal profiler supports only CPython 3.10 to 3.14")
+	if major != 3 || minor < 10 || minor > 15 {
+		t.Skip("the Signal profiler supports only CPython 3.10 to 3.15")
 	}
 }
 
@@ -500,6 +500,9 @@ func startWorkload(t *testing.T, net *dockertest.Network, appName, canary string
 		"CANARY":                        canary,
 		"PIP_DISABLE_PIP_VERSION_CHECK": "1",
 	}
+	if jit, ok := os.LookupEnv("PYTHON_JIT"); ok {
+		env["PYTHON_JIT"] = jit
+	}
 	return dockertest.StartContainer(t, dockertest.ContainerRequest{
 		Image:    pythonImage(),
 		Platform: wheelDockerPlatform(),
@@ -524,6 +527,9 @@ func startPythonTestContainer(t *testing.T, net *dockertest.Network, wheelDir, s
 		"PYTHONDONTWRITEBYTECODE":       "1",
 		"PYROSCOPE_SERVER_ADDRESS":      "http://pyroscope:4040",
 		"PIP_DISABLE_PIP_VERSION_CHECK": "1",
+	}
+	if jit, ok := os.LookupEnv("PYTHON_JIT"); ok {
+		mergedEnv["PYTHON_JIT"] = jit
 	}
 	for k, v := range env {
 		mergedEnv[k] = v

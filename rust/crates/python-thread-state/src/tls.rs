@@ -13,6 +13,11 @@
 //! The DTV cannot serve both: a thread that existed before a module was placed in the static
 //! surplus never gets a DTV entry for it, because static accesses do not go through the DTV.
 //!
+//! glibc fills the DTV of a new thread with the thread's static blocks and leaves dynamic ones
+//! unallocated until the first access. That is how [`locate`] tells the two apart. The same
+//! distance from the thread pointer in two threads is not enough: two dynamic blocks can sit
+//! equally far from their thread pointers.
+//!
 //! The TCB and DTV layouts are private to glibc. [`locate`] accepts a location only after
 //! checking it on two threads against the loader's own answer.
 
@@ -178,23 +183,31 @@ pub fn find_value(module: Module, value: usize) -> Option<usize> {
     offsets.next().is_none().then_some(offset)
 }
 
-#[derive(Clone, Copy)]
+/// What the loader and the DTV say about a module's block in one thread.
+#[derive(Debug, Clone, Copy)]
 struct Probe {
     /// Block address relative to the thread pointer.
     delta: isize,
+    /// Whether the DTV recorded the block before the loader was asked for it. On a thread
+    /// that never accessed the module this tells static from dynamic TLS: glibc fills the DTV
+    /// of a new thread with its static blocks and leaves dynamic ones unallocated.
+    preset: bool,
     /// Whether the DTV records the block the loader returned.
     in_dtv: bool,
 }
 
 impl Probe {
     fn current(module: usize) -> Probe {
+        let preset = dtv_block(module);
         let block = block(module);
         Probe {
             delta: block.wrapping_sub(thread_pointer()) as isize,
+            preset: preset == Some(block),
             in_dtv: dtv_block(module) == Some(block),
         }
     }
 
+    /// Probes a thread that has not accessed the module.
     fn on_new_thread(module: usize) -> Option<Probe> {
         struct Call {
             module: usize,
@@ -228,17 +241,25 @@ impl Probe {
 /// short-lived thread to compare with the calling one. `None` if neither location holds on
 /// both threads. Not async-signal-safe.
 pub fn locate(module: Module, offset: usize) -> Option<Location> {
+    // The first loader access settles a module that is in neither kind of TLS yet as dynamic,
+    // so the calling thread goes first: the new thread then starts with the final choice.
     let here = Probe::current(module.id);
-    let there = Probe::on_new_thread(module.id)?;
-    if here.delta == there.delta {
+    let new = Probe::on_new_thread(module.id)?;
+    classify(module.id, offset, here, new)
+}
+
+/// `new` must come from a thread created after `here` was taken, before its first access to
+/// the module.
+fn classify(module: usize, offset: usize, here: Probe, new: Probe) -> Option<Location> {
+    // Equal distances from the thread pointer alone do not make a block static: the
+    // allocations of two threads' dynamic blocks can sit equally far from their thread
+    // pointers.
+    if new.preset && here.delta == new.delta {
         Some(Location::Fixed {
             offset: here.delta.wrapping_add_unsigned(offset),
         })
-    } else if here.in_dtv && there.in_dtv {
-        Some(Location::Dtv {
-            module: module.id,
-            offset,
-        })
+    } else if here.in_dtv && new.in_dtv {
+        Some(Location::Dtv { module, offset })
     } else {
         None
     }
@@ -309,6 +330,45 @@ mod tests {
         assert!(find_value(module, marker).is_some());
         PAIR.set([marker; 2]);
         assert_eq!(find_value(module, marker), None);
+    }
+
+    fn probe(delta: isize, preset: bool, in_dtv: bool) -> Probe {
+        Probe {
+            delta,
+            preset,
+            in_dtv,
+        }
+    }
+
+    #[test]
+    fn dynamic_blocks_equally_far_from_their_thread_pointers_are_not_fixed() {
+        let dtv = Some(Location::Dtv {
+            module: 3,
+            offset: 8,
+        });
+        // The calling thread's `preset` says nothing: it may have accessed the module before.
+        for here_preset in [false, true] {
+            let here = probe(-0x4000, here_preset, true);
+            assert_eq!(classify(3, 8, here, probe(-0x4000, false, true)), dtv);
+            assert_eq!(classify(3, 8, here, probe(-0x8000, false, true)), dtv);
+            // Something accessed the module on the new thread before the probe.
+            assert_eq!(classify(3, 8, here, probe(-0x8000, true, true)), dtv);
+            assert_eq!(
+                classify(3, 8, here, probe(-0x4000, true, true)),
+                Some(Location::Fixed { offset: -0x3ff8 })
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_missing_from_the_dtv_are_not_located() {
+        for (here_in_dtv, new_in_dtv) in [(false, true), (true, false), (false, false)] {
+            for new_delta in [-0x4000, -0x8000] {
+                let here = probe(-0x4000, false, here_in_dtv);
+                let new = probe(new_delta, false, new_in_dtv);
+                assert_eq!(classify(3, 8, here, new), None);
+            }
+        }
     }
 
     const LIBRARY: &str = "
@@ -421,6 +481,8 @@ mod tests {
         assert!(matches!(location, Location::Dtv { .. }), "{location:?}");
 
         let module = library.module;
+        let new = Probe::on_new_thread(module.id).unwrap();
+        assert!(!new.preset && new.in_dtv, "{new:?}");
         // Threads that never accessed the variable have no block; reading must not allocate one.
         assert_eq!(before.run(move || location.read()), None);
         assert_eq!(before.run(move || dtv_block(module.id)), None);
@@ -444,6 +506,8 @@ mod tests {
         assert!(matches!(location, Location::Fixed { .. }), "{location:?}");
 
         let module = library.module;
+        let new = Probe::on_new_thread(module.id).unwrap();
+        assert!(new.preset && new.in_dtv, "{new:?}");
         assert_eq!(before.run(move || location.read()), Some(0));
         // The thread that predates the dlopen uses the variable, yet its DTV has no entry.
         let read = before.run(move || {

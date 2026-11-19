@@ -9,11 +9,12 @@
 //! `PyGILState_GetThisThreadState` can allocate and lock inside glibc's dynamic loader. On
 //! glibc (x86-64 and aarch64) [`current`] reads the variable directly: at a fixed offset from
 //! the thread pointer, or through the thread's DTV when libpython was `dlopen`ed into dynamic
-//! TLS. [`init`] picks one and verifies it against the loader on two threads, because both
-//! rely on glibc's private TCB and DTV layouts. Through the DTV, only a thread state whose
-//! `thread_id` is the calling thread is accepted, so a thread running a state created on
-//! another thread has none. musl needs none of this: its TLS accesses are plain loads. Other
-//! platforms are unsupported on 3.15.
+//! TLS. [`init`] picks one by whether glibc put the variable's block in the DTV of a new thread
+//! before its first access, which it does for static TLS only, and verifies it against the
+//! loader on two threads, because both rely on glibc's private TCB and DTV layouts. Through the
+//! DTV, only a thread state whose `thread_id` is the calling thread is accepted, so a thread
+//! running a state created on another thread has none. musl needs none of this: its TLS
+//! accesses are plain loads. Other platforms are unsupported on 3.15.
 //!
 //! Direct reads use kindasafe: recovery must be installed and its signals unblocked on the
 //! calling thread, as for the unwinder.

@@ -16,6 +16,7 @@
 
 - CPython 3.15 keeps the thread state in a thread-local variable. Do not call `PyGILState_GetThisThreadState` or any other TLS accessor of another module from the signal handler on glibc: the access can allocate and lock in the dynamic loader.
 - The handler reads the variable with direct loads: at a fixed offset from the thread pointer, or through the thread's DTV when libpython is in dynamic TLS. Keep both; the DTV has no entry for threads that predate a `dlopen` into the static TLS surplus.
+- Tell static from dynamic TLS by the DTV of a new thread before its first access: glibc fills in static blocks only. The same offset from the thread pointer in two threads does not prove static TLS, because two dynamic blocks can sit equally far from their thread pointers.
 - Both depend on glibc's private TCB and DTV layouts. Keep the init-time verification against the loader on two threads, and fail Signal startup when it does not hold.
 
 ## Fault recovery signal handlers
